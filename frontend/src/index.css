@@ -61,6 +61,15 @@
   animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
+/* Cluster region "scout is actively working this cluster" pulse */
+@keyframes clusterPulse {
+  0%, 100% { box-shadow: 0 0 20px rgba(199, 123, 92, 0.18); }
+  50% { box-shadow: 0 0 36px rgba(199, 123, 92, 0.42); }
+}
+.cluster-region-active {
+  animation: clusterPulse 1.6s ease-in-out infinite;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
   height: 6px;

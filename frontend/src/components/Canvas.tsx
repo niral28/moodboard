@@ -1,12 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Card } from './Card';
 import type { CardType } from './Card';
+import { SuggestionCard } from './SuggestionCard';
+import type { SuggestionType } from './SuggestionCard';
 import { Sparkles, Pencil } from 'lucide-react';
 import type { ClusterType } from '../App';
 
 interface CanvasProps {
   cards: CardType[];
   clusters: ClusterType[];
+  scoutingClusters: Set<string>;
+  suggestions: SuggestionType[];
   onRemoveCard: (id: string) => void;
   offset: { x: number; y: number };
   onPanChange: (offset: { x: number; y: number }) => void;
@@ -19,6 +23,10 @@ interface CanvasProps {
     dy: number,
     snapshot: { id: string; x: number; y: number }[],
   ) => void;
+  onAddSuggestion: (s: SuggestionType) => void;
+  onDismissSuggestion: (s: SuggestionType, reason: string | null) => void;
+  onStageSuggestion: (url: string) => Promise<void>;
+  isStagingUrl: string | null;
 }
 
 // Approximate card height for cluster bound calculation (varies with content).
@@ -29,12 +37,13 @@ const CLUSTER_LABEL_BAND = 40;
 interface ClusterRegionProps {
   cluster: ClusterType;
   memberCards: CardType[];
+  isActive: boolean;
   onRename: (newLabel: string) => void;
   onMove: (dx: number, dy: number, snapshot: { id: string; x: number; y: number }[]) => void;
   scale: number;
 }
 
-const ClusterRegion: React.FC<ClusterRegionProps> = ({ cluster, memberCards, onRename, onMove, scale }) => {
+const ClusterRegion: React.FC<ClusterRegionProps> = ({ cluster, memberCards, isActive, onRename, onMove, scale }) => {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(cluster.custom_label || cluster.label);
   const dragRef = useRef<{
@@ -87,17 +96,20 @@ const ClusterRegion: React.FC<ClusterRegionProps> = ({ cluster, memberCards, onR
       className="absolute"
       style={{ left: minX, top: minY, width: w, height: h, pointerEvents: 'none' }}
     >
-      {/* Region box */}
+      {/* Region box (animates when scout is actively working this cluster) */}
       <div
-        className="absolute inset-0 rounded-2xl border-2 border-dashed"
+        className={`absolute inset-0 rounded-2xl border-2 border-dashed transition-all duration-300 ${
+          isActive ? 'cluster-region-active' : ''
+        }`}
         style={{
-          borderColor: 'rgba(199, 123, 92, 0.35)',
-          backgroundColor: 'rgba(199, 123, 92, 0.05)',
+          borderColor: isActive ? 'rgba(199, 123, 92, 0.95)' : 'rgba(199, 123, 92, 0.35)',
+          backgroundColor: isActive ? 'rgba(199, 123, 92, 0.12)' : 'rgba(199, 123, 92, 0.05)',
+          boxShadow: isActive ? '0 0 24px rgba(199, 123, 92, 0.25)' : 'none',
         }}
       />
       {/* Label band */}
       <div
-        className="absolute left-4 top-0 -translate-y-1/2 flex items-center gap-1 px-3 py-1 rounded-full shadow"
+        className="absolute left-4 top-0 -translate-y-1/2 flex items-center gap-1.5 px-3 py-1 rounded-full shadow"
         style={{
           backgroundColor: '#C77B5C',
           color: 'white',
@@ -129,7 +141,14 @@ const ClusterRegion: React.FC<ClusterRegionProps> = ({ cluster, memberCards, onR
         ) : (
           <>
             <span className="text-[11px] font-bold uppercase tracking-wider">{labelText}</span>
-            <Pencil className="w-2.5 h-2.5 opacity-60" />
+            {isActive ? (
+              <span className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider opacity-90">
+                <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                scouting
+              </span>
+            ) : (
+              <Pencil className="w-2.5 h-2.5 opacity-60" />
+            )}
           </>
         )}
       </div>
@@ -140,6 +159,8 @@ const ClusterRegion: React.FC<ClusterRegionProps> = ({ cluster, memberCards, onR
 export const Canvas: React.FC<CanvasProps> = ({
   cards,
   clusters,
+  scoutingClusters,
+  suggestions,
   onRemoveCard,
   offset,
   onPanChange,
@@ -147,6 +168,10 @@ export const Canvas: React.FC<CanvasProps> = ({
   onScaleChange,
   onRenameCluster,
   onMoveCluster,
+  onAddSuggestion,
+  onDismissSuggestion,
+  onStageSuggestion,
+  isStagingUrl,
 }) => {
   const rootRef = useRef<HTMLDivElement>(null);
   const panStart = useRef<{ px: number; py: number; ox: number; oy: number } | null>(null);
@@ -198,13 +223,25 @@ export const Canvas: React.FC<CanvasProps> = ({
 
   const isPanning = panStart.current !== null;
 
-  // Pre-compute cluster → member cards mapping.
+  // Pre-compute cluster → member cards mapping (includes suggestions as ghost
+  // members so the cluster bounding region grows to wrap around them too).
   const clusterMembers = useMemo(() => {
-    return clusters.map((cluster) => ({
-      cluster,
-      members: cards.filter((c) => cluster.card_ids.includes(c.id)),
-    }));
-  }, [clusters, cards]);
+    return clusters.map((cluster) => {
+      const realCards = cards.filter((c) => cluster.card_ids.includes(c.id));
+      const ghosts: CardType[] = suggestions
+        .filter((s) => s.cluster_id === cluster.id)
+        .map((s, i) => ({
+          id: `ghost-${cluster.id}-${i}`,
+          type: 'link' as const,
+          title: s.title,
+          summary: '',
+          entities: [],
+          x: s.x,
+          y: s.y,
+        }));
+      return { cluster, members: [...realCards, ...ghosts] };
+    });
+  }, [clusters, cards, suggestions]);
 
   return (
     <div
@@ -230,6 +267,7 @@ export const Canvas: React.FC<CanvasProps> = ({
             key={cluster.id}
             cluster={cluster}
             memberCards={members}
+            isActive={scoutingClusters.has(cluster.id)}
             onRename={(newLabel) => onRenameCluster(cluster.id, newLabel)}
             onMove={(dx, dy, snap) => onMoveCluster(cluster.id, dx, dy, snap)}
             scale={scale}
@@ -240,6 +278,20 @@ export const Canvas: React.FC<CanvasProps> = ({
         {cards.map((card) => (
           <div key={card.id} className="pointer-events-auto">
             <Card card={card} onRemove={onRemoveCard} />
+          </div>
+        ))}
+
+        {/* Streaming suggestions as ghost cards inside their cluster region */}
+        {suggestions.map((s) => (
+          <div key={`s-${s.url}`} className="pointer-events-auto">
+            <SuggestionCard
+              suggestion={s}
+              onAdd={() => onAddSuggestion(s)}
+              onDismiss={(reason) => onDismissSuggestion(s, reason)}
+              onStage={() => onStageSuggestion(s.url)}
+              isStaging={isStagingUrl === s.url}
+              stagingLocked={isStagingUrl !== null}
+            />
           </div>
         ))}
       </div>

@@ -7,6 +7,8 @@ export interface LogEntry {
   level: 'info' | 'success' | 'warning' | 'error';
   timestamp: string;
   details?: string;
+  cluster_id?: string;
+  phase?: 'start' | 'end';
 }
 
 interface ActivityLogProps {

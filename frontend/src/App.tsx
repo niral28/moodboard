@@ -8,7 +8,8 @@ import type { Candidate } from './components/Sidebar';
 import { ActivityLog } from './components/ActivityLog';
 import type { LogEntry } from './components/ActivityLog';
 import type { CardType } from './components/Card';
-import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
+import type { SuggestionType } from './components/SuggestionCard';
+import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp, ZoomIn, ZoomOut, Maximize2, Download, Upload } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
 
@@ -125,7 +126,8 @@ function autoLayoutByCluster(clusters: ClusterType[], cards: import('./component
 
 export default function App() {
   const [cards, setCards] = useState<CardType[]>([]);
-  const [suggestions, setSuggestions] = useState<Candidate[]>([]);
+  // Suggestions now live on the canvas as ghost cards, positioned in their cluster.
+  const [suggestions, setSuggestions] = useState<SuggestionType[]>([]);
   const [tasteProfile, setTasteProfile] = useState('');
   const [gaps, setGaps] = useState<string[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -137,10 +139,47 @@ export default function App() {
   const [canvasOffset, setCanvasOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [canvasScale, setCanvasScale] = useState<number>(1);
   const [clusters, setClusters] = useState<ClusterType[]>([]);
+  const [scoutingClusters, setScoutingClusters] = useState<Set<string>>(new Set());
 
   // dnd-kit: require 5px of movement before starting a drag — so clicks on
   // buttons inside cards (expand, delete) work normally without triggering drag.
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  // Refs so SSE handlers (which capture state at mount) can read current values
+  // when deciding where to place an incoming suggestion.
+  const clustersRef = React.useRef<ClusterType[]>([]);
+  const cardsRef = React.useRef<CardType[]>([]);
+  const suggestionsRef = React.useRef<SuggestionType[]>([]);
+  useEffect(() => { clustersRef.current = clusters; }, [clusters]);
+  useEffect(() => { cardsRef.current = cards; }, [cards]);
+  useEffect(() => { suggestionsRef.current = suggestions; }, [suggestions]);
+
+  // Place an incoming suggestion at the next open slot inside its cluster's grid.
+  // Falls back to the top-left of the canvas if cluster isn't found.
+  function placeSuggestionInCluster(clusterId: string | undefined): { x: number; y: number } {
+    if (!clusterId) {
+      return { x: 60, y: 60 };
+    }
+    const cs = clustersRef.current;
+    const clusterIdx = cs.findIndex((c) => c.id === clusterId);
+    if (clusterIdx === -1) {
+      return { x: 60, y: 60 };
+    }
+    const cluster = cs[clusterIdx];
+    const col = clusterIdx % LAYOUT.COLS;
+    const row = Math.floor(clusterIdx / LAYOUT.COLS);
+    const cx = LAYOUT.PAD + col * (LAYOUT.CLUSTER_W + LAYOUT.CLUSTER_GAP);
+    const cy = LAYOUT.PAD + row * (LAYOUT.CLUSTER_H + LAYOUT.CLUSTER_GAP);
+    const existingCardSlots = cluster.card_ids.length;
+    const existingSuggestionSlots = suggestionsRef.current.filter((s) => s.cluster_id === clusterId).length;
+    const slot = existingCardSlots + existingSuggestionSlots;
+    const sCol = slot % LAYOUT.COLS;
+    const sRow = Math.floor(slot / LAYOUT.COLS);
+    return {
+      x: cx + LAYOUT.INNER_PAD + sCol * (LAYOUT.CARD_W + LAYOUT.CARD_GAP),
+      y: cy + LAYOUT.LABEL_BAND + LAYOUT.INNER_PAD + sRow * (LAYOUT.CARD_H + LAYOUT.CARD_GAP),
+    };
+  }
 
   // 1. Load from LocalStorage or initialize with 4 premium demo cards
   useEffect(() => {
@@ -242,20 +281,53 @@ export default function App() {
     }
   }, [clusters]);
 
-  // 3. Connect to backend Server-Sent Events log stream
+  // 3. Connect to backend Server-Sent Events stream — log entries + live candidates
   useEffect(() => {
     const eventSource = new EventSource(`${API_BASE}/events`);
 
     eventSource.onmessage = (event) => {
       try {
-        const logData = JSON.parse(event.data);
+        const data = JSON.parse(event.data);
+
+        // Streaming candidate from a scout — drop it into its cluster on the canvas.
+        if (data.kind === 'candidate' && data.candidate) {
+          const c = data.candidate as Candidate;
+          const clusterId: string | undefined = data.cluster_id;
+          const pos = placeSuggestionInCluster(clusterId);
+          const suggestion: SuggestionType = {
+            url: c.url,
+            title: c.title,
+            match_reason: c.match_reason,
+            price: c.price,
+            image_url: c.image_url,
+            emoji: (c as any).emoji,
+            cluster_id: clusterId,
+            x: pos.x,
+            y: pos.y,
+          };
+          setSuggestions((prev) => (prev.some((s) => s.url === suggestion.url) ? prev : [...prev, suggestion]));
+          return;
+        }
+
+        // Otherwise it's a log entry. Track scout start/end phases for cluster highlight.
+        const log = data as LogEntry;
+        if (log.cluster_id && log.phase) {
+          const cid = log.cluster_id;
+          const ph = log.phase;
+          setScoutingClusters((prev) => {
+            const next = new Set(prev);
+            if (ph === 'start') next.add(cid);
+            else if (ph === 'end') next.delete(cid);
+            return next;
+          });
+        }
+
         setLogs((prevLogs) => {
-          // Avoid duplicate entries based on identical content + timestamp
           const isDuplicate = prevLogs.some(
-            (l) => l.message === logData.message && l.timestamp === logData.timestamp
+            (l) => l.message === log.message && l.timestamp === log.timestamp
           );
           if (isDuplicate) return prevLogs;
-          return [...prevLogs, logData];
+          return [...prevLogs, log];
         });
       } catch (err) {
         console.error('Failed to parse SSE event:', err);
@@ -486,28 +558,74 @@ export default function App() {
     showToast('Card removed from canvas', 'info');
   };
 
-  // Suggestions panel actions
-  const handleAddSuggestion = (candidate: Candidate) => {
+  // Suggestion → real card: keep the same canvas position so it lands in place.
+  const handleAddSuggestion = (s: SuggestionType) => {
+    const newCardId = Math.random().toString(36).substr(2, 9);
     const newCard: CardType = {
-      id: Math.random().toString(36).substr(2, 9),
+      id: newCardId,
       type: 'link',
-      title: candidate.title,
-      summary: candidate.match_reason,
+      title: s.title,
+      summary: s.match_reason,
       entities: ['scouted', 'suggestion'],
-      url: candidate.url,
-      cover_image: candidate.image_url,
-      x: 200 + Math.random() * 200,
-      y: 200 + Math.random() * 200,
+      url: s.url,
+      cover_image: s.image_url,
+      x: s.x,
+      y: s.y,
+      status: 'ready',
     };
-
     setCards((prev) => [...prev, newCard]);
-    setSuggestions((prev) => prev.filter((s) => s.url !== candidate.url));
-    showToast(`Added: "${candidate.title}"`, 'success');
+    // If this suggestion was inside a cluster, attach the new card to it so
+    // the cluster region grows to include it.
+    if (s.cluster_id) {
+      setClusters((prev) =>
+        prev.map((cl) => (cl.id === s.cluster_id ? { ...cl, card_ids: [...cl.card_ids, newCardId] } : cl)),
+      );
+    }
+    setSuggestions((prev) => prev.filter((x) => x.url !== s.url));
+    showToast(`Added: "${s.title}"`, 'success');
   };
 
-  const handleDismissSuggestion = (url: string) => {
-    setSuggestions((prev) => prev.filter((s) => s.url !== url));
-    showToast('Suggestion dismissed', 'info');
+  // Light-touch taste profile refresh — runs Curate against the current board
+  // but only updates taste_profile + gaps (keeping clusters and card positions
+  // stable). Called after feedback so the user visibly sees the profile evolve.
+  const refreshTasteProfile = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/curate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cards }),
+      });
+      if (!r.ok) return;
+      const data = await r.json();
+      if (typeof data.taste_profile === 'string') setTasteProfile(data.taste_profile);
+      if (Array.isArray(data.gaps)) setGaps(data.gaps);
+    } catch (err) {
+      console.error('taste refresh failed', err);
+    }
+  };
+
+  const handleDismissSuggestion = async (s: SuggestionType, reason: string | null) => {
+    setSuggestions((prev) => prev.filter((x) => x.url !== s.url));
+    try {
+      await fetch(`${API_BASE}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reason,
+          suggestion_title: s.title,
+          suggestion_url: s.url,
+          cluster_id: s.cluster_id || null,
+        }),
+      });
+      showToast(reason ? 'Feedback recorded · refreshing taste profile' : 'Suggestion dismissed', 'info');
+      if (reason) {
+        // Fire-and-forget — the sidebar updates when it returns.
+        refreshTasteProfile();
+      }
+    } catch (err) {
+      console.error('feedback failed', err);
+      showToast('Dismissed (feedback save failed)', 'warning');
+    }
   };
 
   // Stage cart URL page in real Chrome context
@@ -544,6 +662,9 @@ export default function App() {
     }
 
     setLoading(true);
+    // Clear stale suggestions so the new run fills the panel in real time as
+    // each scout's `done` candidates stream over SSE.
+    setSuggestions([]);
     showToast('Curation Agent analyzing board clusters...', 'info');
 
     try {
@@ -593,12 +714,25 @@ export default function App() {
         // Map dispatches into ScoutRequests for batch scouting
         const scoutRequests = orchestrateData.scout_dispatches.map((dispatch: any) => {
           const matchedCluster = curateData.clusters.find((c: any) => c.id === dispatch.cluster_id);
+          const memberIds: string[] = matchedCluster?.card_ids || [];
+          const memberCards = cards
+            .filter((c) => memberIds.includes(c.id))
+            .map((c) => ({
+              id: c.id,
+              type: c.type,
+              title: c.title,
+              summary: c.summary,
+              entities: c.entities,
+              visual_features: c.visual_features,
+              url: c.url,
+            }));
           return {
             cluster_id: dispatch.cluster_id,
             cluster_label: matchedCluster ? matchedCluster.label : 'Style Cluster',
             search_hints: dispatch.search_hints,
             taste_profile: curateData.taste_profile,
             user_currency: USER_CURRENCY,
+            cluster_cards: memberCards,
           };
         });
 
@@ -610,8 +744,30 @@ export default function App() {
         if (!scoutResponse.ok) throw new Error('Scouts fanning out failed');
         const scoutCandidates: Candidate[] = await scoutResponse.json();
 
-        // Update suggestions
-        setSuggestions(scoutCandidates);
+        // SSE has been streaming candidates with positions; merge the bulk
+        // response as a safety net (dedupe by URL). Anything missed gets
+        // placed against the cluster from the dispatch list — fall back to
+        // the canvas origin if we can't tell.
+        setSuggestions((prev) => {
+          const seen = new Set(prev.map((s) => s.url));
+          const merged = [...prev];
+          for (const c of scoutCandidates) {
+            if (seen.has(c.url)) continue;
+            const pos = placeSuggestionInCluster(undefined);
+            merged.push({
+              url: c.url,
+              title: c.title,
+              match_reason: c.match_reason,
+              price: c.price,
+              image_url: c.image_url,
+              emoji: (c as any).emoji,
+              cluster_id: undefined,
+              x: pos.x,
+              y: pos.y,
+            });
+          }
+          return merged;
+        });
         showToast(`Scouts retrieved ${scoutCandidates.length} curated design matches!`, 'success');
       } else {
         showToast('Curator found no style gaps. Your board is perfect!', 'success');
@@ -621,6 +777,61 @@ export default function App() {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // --- Export / import board state as a portable JSON snapshot ---
+  const BOARD_FILE_VERSION = 1;
+
+  const handleExportBoard = () => {
+    const snapshot = {
+      version: BOARD_FILE_VERSION,
+      exported_at: new Date().toISOString(),
+      cards,
+      clusters,
+      taste_profile: tasteProfile,
+      gaps,
+      suggestions,
+    };
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    a.download = `moodboard-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`Exported ${cards.length} card${cards.length === 1 ? '' : 's'}`, 'success');
+  };
+
+  const importFileRef = React.useRef<HTMLInputElement>(null);
+
+  const handleImportBoard = async (file: File) => {
+    try {
+      const text = await file.text();
+      const snapshot = JSON.parse(text);
+      if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.cards)) {
+        throw new Error('Not a valid moodboard snapshot');
+      }
+      // Apply atomically. status field defaults to ready on import.
+      const restoredCards: CardType[] = (snapshot.cards as CardType[]).map((c) => ({
+        ...c,
+        status: c.status && c.status !== 'ready' ? 'ready' : c.status,
+      }));
+      setCards(restoredCards);
+      setClusters(Array.isArray(snapshot.clusters) ? snapshot.clusters : []);
+      setTasteProfile(typeof snapshot.taste_profile === 'string' ? snapshot.taste_profile : '');
+      setGaps(Array.isArray(snapshot.gaps) ? snapshot.gaps : []);
+      setSuggestions(Array.isArray(snapshot.suggestions) ? snapshot.suggestions : []);
+      // Reset viewport so the imported board lands in a known position.
+      setCanvasOffset({ x: 0, y: 0 });
+      setCanvasScale(1);
+      showToast(`Imported ${restoredCards.length} card${restoredCards.length === 1 ? '' : 's'}`, 'success');
+    } catch (err) {
+      console.error('import failed', err);
+      showToast('Import failed — file is not a valid moodboard snapshot', 'error');
     }
   };
 
@@ -668,6 +879,8 @@ export default function App() {
           <Canvas
             cards={cards}
             clusters={clusters}
+            scoutingClusters={scoutingClusters}
+            suggestions={suggestions}
             onRemoveCard={handleRemoveCard}
             offset={canvasOffset}
             onPanChange={setCanvasOffset}
@@ -675,6 +888,10 @@ export default function App() {
             onScaleChange={setCanvasScale}
             onRenameCluster={handleRenameCluster}
             onMoveCluster={handleMoveCluster}
+            onAddSuggestion={handleAddSuggestion}
+            onDismissSuggestion={handleDismissSuggestion}
+            onStageSuggestion={handleStageSuggestion}
+            isStagingUrl={isStagingUrl}
           />
         </div>
 
@@ -722,6 +939,32 @@ export default function App() {
               <Maximize2 className="w-3.5 h-3.5" />
             </button>
           </div>
+          {/* Hidden file input for import */}
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleImportBoard(f);
+              if (importFileRef.current) importFileRef.current.value = '';
+            }}
+          />
+          <button
+            onClick={() => importFileRef.current?.click()}
+            className="px-2.5 py-1.5 rounded-md panel-surface text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors flex items-center"
+            title="Import board from JSON"
+          >
+            <Upload className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={handleExportBoard}
+            className="px-2.5 py-1.5 rounded-md panel-surface text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors flex items-center"
+            title="Export board as JSON"
+          >
+            <Download className="w-3.5 h-3.5" />
+          </button>
           <button
             onClick={handleResetBoard}
             className="px-3 py-1.5 rounded-md panel-surface text-[11px] font-semibold text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors flex items-center gap-1.5"
@@ -739,12 +982,12 @@ export default function App() {
             {loading ? (
               <>
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span>Working…</span>
+                <span>Searching…</span>
               </>
             ) : (
               <>
                 <Sparkles className="w-3.5 h-3.5" />
-                <span>Tick pipeline</span>
+                <span>Find Inspiration</span>
               </>
             )}
           </button>
@@ -756,15 +999,7 @@ export default function App() {
             sidebarOpen ? 'translate-x-0' : 'translate-x-[calc(100%+1rem)]'
           }`}
         >
-          <Sidebar
-            tasteProfile={tasteProfile}
-            gaps={gaps}
-            suggestions={suggestions}
-            onAddSuggestion={handleAddSuggestion}
-            onDismissSuggestion={handleDismissSuggestion}
-            onStageSuggestion={handleStageSuggestion}
-            isStagingUrl={isStagingUrl}
-          />
+          <Sidebar tasteProfile={tasteProfile} gaps={gaps} />
         </aside>
         <button
           onClick={() => setSidebarOpen((o) => !o)}

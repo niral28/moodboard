@@ -61,6 +61,7 @@ class Candidate(BaseModel):
     url: str = Field(description="Simulated shopping/reference URL matching search hint")
     price: Optional[str] = Field(None, description="Estimated price (e.g. '$120') if applicable")
     image_url: Optional[str] = Field(None, description="Placeholder or simulated visual match")
+    emoji: Optional[str] = Field(None, description="Single emoji representing the candidate, used as a visual fallback when no image is available")
     match_reason: str = Field(description="Explanation of why this candidate fits the user's taste and gaps")
 
 class ScoutRequest(BaseModel):
@@ -69,6 +70,23 @@ class ScoutRequest(BaseModel):
     search_hints: List[str]
     taste_profile: str
     user_currency: Optional[str] = Field("USD", description="3-letter ISO currency code for displaying prices")
+    cluster_cards: Optional[List[dict]] = Field(
+        default_factory=list,
+        description="Cards belonging to this cluster (title, summary, entities, visual_features, type) for the scout to reason about.",
+    )
+
+
+# --- Feedback ---
+class FeedbackRequest(BaseModel):
+    reason: Optional[str] = Field(None, description="User's explanation; may be empty.")
+    suggestion_title: Optional[str] = Field(None, description="Title of the dismissed candidate for context.")
+    suggestion_url: Optional[str] = Field(None, description="URL of the dismissed candidate for context.")
+    cluster_id: Optional[str] = Field(None, description="Cluster the suggestion belonged to, if known.")
+
+
+class FeedbackResponse(BaseModel):
+    ok: bool
+    timestamp: str
 
 class ScoutResponse(BaseModel):
     candidates: List[Candidate] = Field(description="List of scouted suggestions")

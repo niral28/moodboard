@@ -15,11 +15,12 @@ from sse_starlette.sse import EventSourceResponse
 from models import (
     Card, IngestRequest, Cluster, CurateRequest, CurateResponse,
     ScoutDispatch, OrchestrateRequest, OrchestrateResponse,
-    Candidate, ScoutRequest, ScoutResponse, StageRequest, StageResponse
+    Candidate, ScoutRequest, ScoutResponse, StageRequest, StageResponse,
+    FeedbackRequest, FeedbackResponse,
 )
 from agents import (
     run_ingest, run_curate, run_orchestrate, run_scout_single, run_playwright_stage,
-    event_logs, event_queue, append_log
+    event_logs, event_queue, append_log, append_journal,
 )
 
 # Configure logging
@@ -158,7 +159,13 @@ async def scout(requests: List[ScoutRequest]):
     tasks = []
     for req in requests:
         dispatch = ScoutDispatch(cluster_id=req.cluster_id, priority="high", search_hints=req.search_hints)
-        tasks.append(run_scout_single(dispatch, req.taste_profile, req.cluster_label, req.user_currency or "USD"))
+        tasks.append(run_scout_single(
+            dispatch,
+            req.taste_profile,
+            req.cluster_label,
+            req.user_currency or "USD",
+            cluster_cards=req.cluster_cards or [],
+        ))
         
     results = await asyncio.gather(*tasks)
     
@@ -170,7 +177,26 @@ async def scout(requests: List[ScoutRequest]):
     append_log("scout", f"Concurrent scouting complete. Retrieved a total of {len(all_candidates)} aesthetic suggestions.", "success")
     return all_candidates
 
-# --- 7. Stage Endpoint ---
+# --- 7. Feedback Endpoint ---
+@app.post("/feedback", response_model=FeedbackResponse)
+async def feedback(req: FeedbackRequest):
+    """Record a user's dismissal of a suggestion (with optional reason)
+    into the shared Journal. Curator and Scout consume recent feedback as
+    hard constraints on subsequent Ticks."""
+    suggestion_ref = req.suggestion_title or req.suggestion_url or "a suggestion"
+    body = req.reason.strip() if (req.reason and req.reason.strip()) else f"dismissed without reason: {suggestion_ref}"
+    refs = [r for r in [req.cluster_id, req.suggestion_url] if r]
+    entry = append_journal("feedback", body, references=refs)
+    append_log(
+        "orchestrate",
+        f"Feedback recorded for '{suggestion_ref}'.",
+        "info",
+        details=body,
+    )
+    return FeedbackResponse(ok=True, timestamp=entry["timestamp"])
+
+
+# --- 8. Stage Endpoint ---
 @app.post("/stage", response_model=StageResponse)
 async def stage(req: StageRequest):
     """
