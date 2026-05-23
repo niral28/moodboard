@@ -20,6 +20,7 @@ export interface CardType {
   body_summary?: string;
   x: number;
   y: number;
+  status?: 'pending' | 'enriching' | 'ready';
 }
 
 interface CardProps {
@@ -104,13 +105,26 @@ export const Card: React.FC<CardProps> = ({ card, onRemove }) => {
           </div>
         )}
 
-        {/* Type chip top-left */}
-        <span
-          className="absolute top-2 left-2 text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded-full bg-white/90 backdrop-blur-sm border"
-          style={{ color: theme.accent, borderColor: theme.accent + '60' }}
-        >
-          {theme.label}
-        </span>
+        {/* Type chip OR analyzing pulse (top-left) */}
+        {card.status && card.status !== 'ready' ? (
+          <span
+            className="absolute top-2 left-2 text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded-full bg-white/95 border flex items-center gap-1"
+            style={{ color: theme.accent, borderColor: theme.accent + '60' }}
+          >
+            <span
+              className="w-1.5 h-1.5 rounded-full animate-pulse"
+              style={{ backgroundColor: theme.accent }}
+            />
+            <span>Analyzing</span>
+          </span>
+        ) : (
+          <span
+            className="absolute top-2 left-2 text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded-full bg-white/90 backdrop-blur-sm border"
+            style={{ color: theme.accent, borderColor: theme.accent + '60' }}
+          >
+            {theme.label}
+          </span>
+        )}
 
         {/* Delete on hover (top-right) */}
         <button

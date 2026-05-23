@@ -8,7 +8,7 @@ import type { Candidate } from './components/Sidebar';
 import { ActivityLog } from './components/ActivityLog';
 import type { LogEntry } from './components/ActivityLog';
 import type { CardType } from './components/Card';
-import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp } from 'lucide-react';
+import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
 
@@ -31,10 +31,96 @@ function detectCurrency(): string {
 }
 const USER_CURRENCY = detectCurrency();
 
+// Downsize uploaded images to ~720px max before storing as the card's cover.
+// Keeps localStorage manageable and shrinks the curate payload too.
+async function resizeImageFileToDataUrl(file: File, maxDim = 720, quality = 0.85): Promise<string> {
+  const original = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const ratio = Math.min(maxDim / img.width, maxDim / img.height, 1);
+      const w = Math.round(img.width * ratio);
+      const h = Math.round(img.height * ratio);
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { resolve(original); return; }
+      ctx.drawImage(img, 0, 0, w, h);
+      try {
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      } catch {
+        resolve(original);
+      }
+    };
+    img.onerror = () => resolve(original);
+    img.src = original;
+  });
+}
+
 interface Toast {
   id: string;
   type: 'success' | 'error' | 'info' | 'warning';
   message: string;
+}
+
+export interface ClusterType {
+  id: string;
+  label: string;          // original from curator
+  custom_label?: string;  // user-renamed (preserved across re-curates)
+  card_ids: string[];
+}
+
+// Auto-layout cards into a 2-column grid of clusters. Cards in the same cluster
+// land in their own internal 2-column grid below a label band.
+const LAYOUT = {
+  PAD: 80,
+  COLS: 2,
+  CLUSTER_W: 620,
+  CLUSTER_H: 700,
+  CLUSTER_GAP: 80,
+  INNER_PAD: 28,
+  LABEL_BAND: 56,
+  CARD_W: 260,
+  CARD_H: 340,
+  CARD_GAP: 20,
+};
+
+function autoLayoutByCluster(clusters: ClusterType[], cards: import('./components/Card').CardType[]) {
+  const byId = new Map(cards.map((c) => [c.id, c]));
+  const positioned = new Set<string>();
+  const out: typeof cards = [];
+
+  clusters.forEach((cluster, ci) => {
+    const col = ci % LAYOUT.COLS;
+    const row = Math.floor(ci / LAYOUT.COLS);
+    const cx = LAYOUT.PAD + col * (LAYOUT.CLUSTER_W + LAYOUT.CLUSTER_GAP);
+    const cy = LAYOUT.PAD + row * (LAYOUT.CLUSTER_H + LAYOUT.CLUSTER_GAP);
+
+    cluster.card_ids.forEach((cid, ki) => {
+      const card = byId.get(cid);
+      if (!card) return;
+      const kCol = ki % LAYOUT.COLS;
+      const kRow = Math.floor(ki / LAYOUT.COLS);
+      out.push({
+        ...card,
+        x: cx + LAYOUT.INNER_PAD + kCol * (LAYOUT.CARD_W + LAYOUT.CARD_GAP),
+        y: cy + LAYOUT.LABEL_BAND + LAYOUT.INNER_PAD + kRow * (LAYOUT.CARD_H + LAYOUT.CARD_GAP),
+      });
+      positioned.add(cid);
+    });
+  });
+
+  cards.forEach((c) => {
+    if (!positioned.has(c.id)) out.push(c);
+  });
+
+  return out;
 }
 
 export default function App() {
@@ -49,6 +135,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [logOpen, setLogOpen] = useState(true);
   const [canvasOffset, setCanvasOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [canvasScale, setCanvasScale] = useState<number>(1);
+  const [clusters, setClusters] = useState<ClusterType[]>([]);
 
   // dnd-kit: require 5px of movement before starting a drag — so clicks on
   // buttons inside cards (expand, delete) work normally without triggering drag.
@@ -60,9 +148,16 @@ export default function App() {
     const savedSuggestions = localStorage.getItem('moodboard_suggestions');
     const savedTaste = localStorage.getItem('moodboard_taste');
     const savedGaps = localStorage.getItem('moodboard_gaps');
+    const savedClusters = localStorage.getItem('moodboard_clusters');
+    if (savedClusters) {
+      try { setClusters(JSON.parse(savedClusters)); } catch {}
+    }
 
     if (savedCards) {
-      setCards(JSON.parse(savedCards));
+      const restored: CardType[] = JSON.parse(savedCards);
+      // Any card stuck mid-enrichment (page closed before backend responded)
+      // gets marked ready so the pulse stops. User can re-paste if they want.
+      setCards(restored.map((c) => (c.status && c.status !== 'ready' ? { ...c, status: 'ready' } : c)));
     } else {
       // Prepopulate with 4 beautiful demo cards (Kyoto theme)
       const demoCards: CardType[] = [
@@ -139,6 +234,14 @@ export default function App() {
     localStorage.setItem('moodboard_gaps', JSON.stringify(gaps));
   }, [gaps]);
 
+  useEffect(() => {
+    if (clusters.length > 0) {
+      localStorage.setItem('moodboard_clusters', JSON.stringify(clusters));
+    } else {
+      localStorage.removeItem('moodboard_clusters');
+    }
+  }, [clusters]);
+
   // 3. Connect to backend Server-Sent Events log stream
   useEffect(() => {
     const eventSource = new EventSource(`${API_BASE}/events`);
@@ -168,6 +271,28 @@ export default function App() {
     };
   }, []);
 
+  // Cmd+V anywhere → if the clipboard has an image, ingest it as a card.
+  // Text paste into focused inputs is unaffected (browser handles it).
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === 'file' && it.type.startsWith('image/')) {
+          const file = it.getAsFile();
+          if (file) {
+            e.preventDefault();
+            handleIngestFile(file);
+            return;
+          }
+        }
+      }
+    };
+    document.addEventListener('paste', onPaste);
+    return () => document.removeEventListener('paste', onPaste);
+  });
+
   // 4. Toast notifications helper
   const showToast = (message: string, type: Toast['type'] = 'info') => {
     const id = Math.random().toString(36).substr(2, 9);
@@ -184,87 +309,175 @@ export default function App() {
     const { active, delta } = event;
     if (!active) return;
 
+    // delta from dnd-kit is in screen pixels; convert to canvas-local by /scale.
+    const dx = delta.x / canvasScale;
+    const dy = delta.y / canvasScale;
     setCards((prevCards) =>
       prevCards.map((card) =>
-        card.id === active.id ? { ...card, x: card.x + delta.x, y: card.y + delta.y } : card,
+        card.id === active.id ? { ...card, x: card.x + dx, y: card.y + dy } : card,
       ),
     );
   };
 
-  // Paste / text ingesting
-  const handleIngestText = async (text: string, forceEmail: boolean) => {
-    try {
-      const response = await fetch(`${API_BASE}/ingest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content: text,
-          hint: forceEmail ? 'email' : null,
-        }),
-      });
+  // --- Lazy / background ingestion (Option C) ---
+  // Card appears on canvas instantly with minimal info, then the backend
+  // enriches it in the background. Card.status drives the visual pulse.
 
-      if (!response.ok) throw new Error('Ingest failed');
-      const card: CardType = await response.json();
-      
-      // Position card semi-randomly near the top-center to prevent overlap
-      card.x = 100 + Math.random() * 200;
-      card.y = 100 + Math.random() * 200;
-      
-      setCards((prev) => [...prev, card]);
-      showToast(`Ingested new ${card.type} card: "${card.title}"`, 'success');
+  // Infer a usable card from raw input client-side so the UI never waits.
+  function inferInitialCard(content: string, hint: string | null): Partial<CardType> {
+    const trimmed = content.trim();
+    if (hint === 'email' || /^\s*(from|subject|to|date)\s*:/im.test(trimmed)) {
+      return { type: 'email', title: 'Email card', summary: '' };
+    }
+    if (/^https?:\/\//i.test(trimmed)) {
+      try {
+        const u = new URL(trimmed);
+        return {
+          type: 'link',
+          title: u.hostname.replace(/^www\./, ''),
+          url: trimmed,
+          summary: '',
+        };
+      } catch {
+        return { type: 'link', title: 'Link', url: trimmed, summary: '' };
+      }
+    }
+    return {
+      type: 'text',
+      title: trimmed.slice(0, 60) || 'Note',
+      summary: trimmed.length > 60 ? trimmed.slice(60, 240) : '',
+    };
+  }
+
+  // Fire-and-forget enrichment. Updates the placeholder card in place.
+  const enrichCard = async (
+    cardId: string,
+    payload: { content: string; hint: string | null; file?: File },
+  ) => {
+    setCards((prev) => prev.map((c) => (c.id === cardId ? { ...c, status: 'enriching' } : c)));
+    try {
+      let response: Response;
+      if (payload.file) {
+        const formData = new FormData();
+        formData.append('file', payload.file);
+        if (payload.hint) formData.append('hint', payload.hint);
+        response = await fetch(`${API_BASE}/ingest`, { method: 'POST', body: formData });
+      } else {
+        response = await fetch(`${API_BASE}/ingest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: payload.content, hint: payload.hint }),
+        });
+      }
+      if (!response.ok) throw new Error('ingest failed');
+      const enriched: CardType = await response.json();
+
+      setCards((prev) =>
+        prev.map((c) => {
+          if (c.id !== cardId) return c;
+          // Merge: preserve id, position, frontend-set cover_image (uploads),
+          // and overwrite metadata fields from the enriched response.
+          return {
+            ...c,
+            type: c.cover_image ? 'image' : enriched.type,
+            title: enriched.title || c.title,
+            summary: enriched.summary || c.summary,
+            entities: enriched.entities || c.entities,
+            url: c.url ?? enriched.url,
+            cover_image: c.cover_image || enriched.cover_image,
+            visual_features: enriched.visual_features ?? c.visual_features,
+            sender: enriched.sender ?? c.sender,
+            subject: enriched.subject ?? c.subject,
+            date: enriched.date ?? c.date,
+            body_summary: enriched.body_summary ?? c.body_summary,
+            status: 'ready',
+          };
+        }),
+      );
     } catch (err) {
-      showToast('Failed to ingest content', 'error');
-      console.error(err);
+      console.error('enrich failed', err);
+      setCards((prev) => prev.map((c) => (c.id === cardId ? { ...c, status: 'ready' } : c)));
+      showToast('Background enrichment failed', 'warning');
     }
   };
 
-  // File uploading (image / .eml)
+  const handleIngestText = async (text: string, forceEmail: boolean) => {
+    const partial = inferInitialCard(text, forceEmail ? 'email' : null);
+    const card: CardType = {
+      id: Math.random().toString(36).substr(2, 9),
+      type: (partial.type as CardType['type']) || 'text',
+      title: partial.title || '...',
+      summary: partial.summary || '',
+      entities: [],
+      url: partial.url,
+      x: 100 + Math.random() * 200,
+      y: 100 + Math.random() * 200,
+      status: 'pending',
+    };
+    setCards((prev) => [...prev, card]);
+    showToast('Card added · analyzing…', 'info');
+    enrichCard(card.id, { content: text, hint: forceEmail ? 'email' : null });
+  };
+
   const handleIngestFile = async (file: File) => {
-    try {
-      console.log('[ingest] file received', { name: file.name, type: file.type, size: file.size });
-      let previewDataUrl: string | null = null;
-      if (file.type.startsWith('image/')) {
-        previewDataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
-        console.log('[ingest] dataURL captured', {
-          start: previewDataUrl.slice(0, 60),
-          length: previewDataUrl.length,
-        });
+    let previewDataUrl: string | null = null;
+    if (file.type.startsWith('image/')) {
+      try {
+        previewDataUrl = await resizeImageFileToDataUrl(file);
+      } catch {
+        previewDataUrl = null;
       }
-
-      const formData = new FormData();
-      formData.append('file', file);
-      if (file.name.endsWith('.eml')) {
-        formData.append('hint', 'email');
-      }
-
-      const response = await fetch(`${API_BASE}/ingest`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error('File ingest failed');
-      const card: CardType = await response.json();
-
-      // Frontend is authoritative for uploaded images.
-      if (previewDataUrl) {
-        card.type = 'image';
-        card.cover_image = previewDataUrl;
-      }
-
-      card.x = 100 + Math.random() * 200;
-      card.y = 100 + Math.random() * 200;
-
-      setCards((prev) => [...prev, card]);
-      showToast(`Uploaded ${card.type} card: "${card.title}"`, 'success');
-    } catch (err) {
-      showToast('Failed to upload and ingest file', 'error');
-      console.error(err);
     }
+
+    const isImage = !!previewDataUrl;
+    const fileTitle = file.name.replace(/\.[^/.]+$/, '');
+    const card: CardType = {
+      id: Math.random().toString(36).substr(2, 9),
+      type: isImage ? 'image' : file.name.endsWith('.eml') ? 'email' : 'text',
+      title: fileTitle.slice(0, 60) || 'Upload',
+      summary: '',
+      entities: [],
+      cover_image: previewDataUrl || undefined,
+      x: 100 + Math.random() * 200,
+      y: 100 + Math.random() * 200,
+      status: 'pending',
+    };
+    setCards((prev) => [...prev, card]);
+    showToast('Card added · analyzing…', 'info');
+    enrichCard(card.id, {
+      content: file.name,
+      hint: file.name.endsWith('.eml') ? 'email' : null,
+      file,
+    });
+  };
+
+  // Cluster operations
+  const handleRenameCluster = (id: string, newLabel: string) => {
+    const trimmed = newLabel.trim();
+    setClusters((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, custom_label: trimmed || undefined } : c)),
+    );
+  };
+
+  // Move a whole cluster by (dx, dy) — applied to the snapshot positions of its cards.
+  const handleMoveCluster = (
+    id: string,
+    dx: number,
+    dy: number,
+    snapshot: { id: string; x: number; y: number }[],
+  ) => {
+    const cluster = clusters.find((c) => c.id === id);
+    if (!cluster) return;
+    const memberIds = new Set(cluster.card_ids);
+    const snapBy = new Map(snapshot.map((s) => [s.id, s]));
+    setCards((prev) =>
+      prev.map((c) => {
+        if (!memberIds.has(c.id)) return c;
+        const s = snapBy.get(c.id);
+        if (!s) return c;
+        return { ...c, x: s.x + dx, y: s.y + dy };
+      }),
+    );
   };
 
   // In-canvas removal
@@ -345,6 +558,19 @@ export default function App() {
 
       setTasteProfile(curateData.taste_profile);
       setGaps(curateData.gaps);
+
+      // Persist clusters, preserving any custom labels across re-curates.
+      const incoming: ClusterType[] = (curateData.clusters || []).map((c: any) => {
+        const existing = clusters.find((ec) => ec.id === c.id);
+        return {
+          id: c.id,
+          label: c.label,
+          custom_label: existing?.custom_label,
+          card_ids: c.card_ids,
+        };
+      });
+      setClusters(incoming);
+      setCards((prev) => autoLayoutByCluster(incoming, prev));
 
       // 2. Orchestrate Dispatches
       showToast('Orchestrator matching gaps into scout briefs...', 'info');
@@ -441,9 +667,14 @@ export default function App() {
         <div className="absolute inset-0 z-0">
           <Canvas
             cards={cards}
+            clusters={clusters}
             onRemoveCard={handleRemoveCard}
             offset={canvasOffset}
             onPanChange={setCanvasOffset}
+            scale={canvasScale}
+            onScaleChange={setCanvasScale}
+            onRenameCluster={handleRenameCluster}
+            onMoveCluster={handleMoveCluster}
           />
         </div>
 
@@ -464,6 +695,33 @@ export default function App() {
 
         {/* Floating actions (top-right) */}
         <div className="absolute top-4 right-4 z-30 flex items-center gap-2 pointer-events-auto">
+          {/* Zoom controls */}
+          <div className="flex items-center panel-surface rounded-md overflow-hidden">
+            <button
+              onClick={() => setCanvasScale((s) => Math.max(0.25, +(s - 0.1).toFixed(2)))}
+              className="px-2 py-1.5 text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors"
+              title="Zoom out (⌘-scroll)"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            <span className="px-2 text-[10px] font-mono text-stone-600 select-none min-w-[42px] text-center">
+              {Math.round(canvasScale * 100)}%
+            </span>
+            <button
+              onClick={() => setCanvasScale((s) => Math.min(2.5, +(s + 0.1).toFixed(2)))}
+              className="px-2 py-1.5 text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors"
+              title="Zoom in (⌘-scroll)"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => { setCanvasScale(1); setCanvasOffset({ x: 0, y: 0 }); }}
+              className="px-2 py-1.5 text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors border-l border-[#D4C5AC]"
+              title="Reset zoom & pan"
+            >
+              <Maximize2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
           <button
             onClick={handleResetBoard}
             className="px-3 py-1.5 rounded-md panel-surface text-[11px] font-semibold text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors flex items-center gap-1.5"

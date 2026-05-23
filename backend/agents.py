@@ -34,6 +34,30 @@ event_logs: List[Dict[str, Any]] = []
 event_queue: asyncio.Queue = asyncio.Queue()
 
 
+# Image bytes destined for Gemini multimodal calls are aggressively downsized:
+# Gemini's visual reasoning works well at small dimensions, and the token cost
+# scales with image area. 384px max-dim + JPEG q70 keeps each image at ~10-30KB.
+def _resize_image_bytes(img_bytes: bytes, max_dim: int = 384, quality: int = 70) -> bytes:
+    try:
+        from PIL import Image
+        from io import BytesIO
+        img = Image.open(BytesIO(img_bytes))
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning(f"Image resize failed ({e}); using original {len(img_bytes)} bytes.")
+        return img_bytes
+
+
+# Hard cap on how many image attachments we send to Curate in one call.
+# Boards with more than this fall back to text-only for the overflow.
+MAX_CURATE_IMAGES = 16
+
+
 def _fetch_og_image(url: str, timeout: float = 3.0) -> Optional[str]:
     """Fast HTTP-only og:image fetch. Returns absolute URL or None. Used for static sites
     (most editorial, retail, booking). SPAs (Instagram, X, etc.) need the browser fallback."""
@@ -209,7 +233,11 @@ async def run_ingest(
 
     parts: List[Any] = []
     if image_bytes:
-        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"))
+        original_size = len(image_bytes)
+        resized = _resize_image_bytes(image_bytes)
+        if resized is not image_bytes:
+            append_log("ingest", f"Resized image for Gemini: {original_size//1024}KB → {len(resized)//1024}KB.", "info")
+        parts.append(types.Part.from_bytes(data=resized, mime_type="image/jpeg"))
 
     user_block = f"User input:\n{content}\n\nHint: {hint or 'none'}"
     prompt = f"{INGEST_PROMPT}\n\n{user_block}"
@@ -256,25 +284,39 @@ Identify `gaps` as 3–5 concrete additions whose absence is conspicuous given t
 
 
 def _extract_image_parts(cards: List[Card]) -> Tuple[List[Any], List[Card]]:
-    """Pull data:image/* URLs off image cards and return Gemini image Parts +
-    a sanitized card list (with the bulky data URL replaced by a reference)."""
+    """Pull data:image/* covers off image cards, downsize them for Gemini, and
+    return the multimodal Parts + a sanitized card list (with the bulky data
+    URL replaced by a reference). Caps the number of attached images to
+    MAX_CURATE_IMAGES — overflow falls back to text-only for those cards."""
     parts: List[Any] = []
     sanitized: List[Card] = []
+    images_attached = 0
+
     for c in cards:
-        url = c.url or ""
-        if c.type == "image" and url.startswith("data:image/"):
+        # cover_image is the canonical preview; for legacy demo cards it may be in url.
+        cover = c.cover_image or (c.url if c.type == "image" else None) or ""
+        if c.type == "image" and cover.startswith("data:image/") and images_attached < MAX_CURATE_IMAGES:
             try:
-                header, b64 = url.split(",", 1)
-                mime = header.split(";")[0].replace("data:", "") or "image/jpeg"
-                img_bytes = base64.b64decode(b64)
-                parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+                _, b64 = cover.split(",", 1)
+                raw = base64.b64decode(b64)
+                resized = _resize_image_bytes(raw)
+                parts.append(types.Part.from_bytes(data=resized, mime_type="image/jpeg"))
                 parts.append(f"^^^ Image above is card id={c.id}, title='{c.title}'")
-                clone = c.model_copy(update={"url": f"(image attached above as card {c.id})"})
+                clone = c.model_copy(update={
+                    "cover_image": f"(image attached as card {c.id})",
+                    "url": c.url if not (c.url or "").startswith("data:image/") else None,
+                })
                 sanitized.append(clone)
+                images_attached += 1
                 continue
             except Exception as e:
                 logger.warning(f"Failed to decode image card {c.id}: {e}")
-        sanitized.append(c)
+        # Strip any heavyweight data URLs so the prompt JSON stays small even
+        # for the cards we couldn't attach as images.
+        if (c.cover_image or "").startswith("data:"):
+            sanitized.append(c.model_copy(update={"cover_image": "(image data omitted)"}))
+        else:
+            sanitized.append(c)
     return parts, sanitized
 
 
