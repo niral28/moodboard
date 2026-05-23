@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+google-generativeai
+playwright
+sse-starlette
+requests
+python-multipart
