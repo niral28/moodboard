@@ -79,46 +79,40 @@ export const DropZone: React.FC<DropZoneProps> = ({ onIngestText, onIngestFile }
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      className={`glass-panel rounded-2xl p-4 transition-all duration-300 border ${
-        isDragging
-          ? 'border-indigo-500 bg-indigo-500/10 scale-[1.01] shadow-[0_0_20px_rgba(99,102,241,0.2)]'
-          : 'border-white/5 hover:border-white/10'
+      className={`panel-surface rounded-xl p-4 transition-colors duration-200 ${
+        isDragging ? 'border-[#C77B5C] bg-[#C77B5C]/8' : ''
       }`}
     >
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
-        {/* Paste Box Container */}
-        <div className="relative flex items-center bg-slate-950/60 border border-white/5 rounded-xl px-3 py-2.5 focus-within:border-indigo-500/50 focus-within:ring-1 focus-within:ring-indigo-500/50 transition-all">
+        <div className="relative flex items-center bg-[#FAF4E4] border border-[#D4C5AC] rounded-lg px-3 py-2.5 focus-within:border-[#C77B5C] focus-within:ring-1 focus-within:ring-[#C77B5C]/40 transition-all">
           <input
             type="text"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             disabled={loading}
-            placeholder="Paste URL, raw text notes, or email content..."
-            className="flex-1 bg-transparent border-0 outline-none text-slate-100 text-xs placeholder-slate-500 disabled:opacity-50"
+            placeholder="Paste URL, notes, or email content…"
+            className="flex-1 bg-transparent border-0 outline-none text-stone-800 text-xs placeholder-stone-400 disabled:opacity-50"
             id="ingest-input"
           />
-          
-          {/* Action buttons inside text bar */}
-          <div className="flex items-center gap-1.5 pl-2 border-l border-white/5">
-            {/* Email parsing toggler */}
+
+          <div className="flex items-center gap-1.5 pl-2 border-l border-[#D4C5AC]">
             <button
               type="button"
               onClick={() => setIsEmail(!isEmail)}
-              className={`p-1.5 rounded-lg border transition-all ${
+              className={`p-1.5 rounded border transition-colors ${
                 isEmail
-                  ? 'bg-violet-500/10 border-violet-500/40 text-violet-400'
-                  : 'bg-transparent border-transparent text-slate-500 hover:text-slate-300'
+                  ? 'bg-[#A85E40]/10 border-[#A85E40]/40 text-[#A85E40]'
+                  : 'bg-transparent border-transparent text-stone-500 hover:text-stone-700'
               }`}
-              title="Force parse as Email card"
+              title="Force-parse as email"
             >
               <Mail className="w-3.5 h-3.5" />
             </button>
 
-            {/* Ingest submit */}
             <button
               type="submit"
               disabled={!inputValue.trim() || loading}
-              className="p-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:bg-slate-800 disabled:text-slate-600 transition-all flex items-center justify-center"
+              className="p-1.5 rounded bg-[#C77B5C] hover:bg-[#B26A4E] text-white disabled:bg-[#E5D8C0] disabled:text-stone-500 transition-colors flex items-center justify-center"
             >
               {loading ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -129,10 +123,9 @@ export const DropZone: React.FC<DropZoneProps> = ({ onIngestText, onIngestFile }
           </div>
         </div>
 
-        {/* Bottom Upload Dropzone Info Bar */}
-        <div className="flex items-center justify-between text-[11px] text-slate-400 px-1 select-none">
+        <div className="flex items-center justify-between text-[11px] text-stone-600 px-1 select-none">
           <div className="flex items-center gap-2">
-            <LinkIcon className="w-3.5 h-3.5 text-slate-500" />
+            <LinkIcon className="w-3.5 h-3.5 text-stone-500" />
             <span>Accepts text, URLs, images, or .eml</span>
           </div>
 
@@ -147,13 +140,13 @@ export const DropZone: React.FC<DropZoneProps> = ({ onIngestText, onIngestFile }
             <button
               type="button"
               onClick={triggerFileSelect}
-              className="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 transition-colors"
+              className="text-[#C77B5C] hover:text-[#B26A4E] font-semibold flex items-center gap-1 transition-colors"
             >
               <Upload className="w-3 h-3" />
-              <span>Upload snapshot</span>
+              <span>Upload image</span>
             </button>
-            <span className="text-slate-600">|</span>
-            <span className="text-slate-500">Drag files here</span>
+            <span className="text-stone-400">|</span>
+            <span className="text-stone-500">or drag in</span>
           </div>
         </div>
       </form>

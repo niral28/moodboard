@@ -1,13 +1,35 @@
 import React, { useState, useEffect } from 'react';
-import { DndContext, DragEndEvent } from '@dnd-kit/core';
+import { DndContext, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
+import type { DragEndEvent } from '@dnd-kit/core';
 import { Canvas } from './components/Canvas';
 import { DropZone } from './components/DropZone';
-import { Sidebar, Candidate } from './components/Sidebar';
-import { ActivityLog, LogEntry } from './components/ActivityLog';
-import { CardType } from './components/Card';
-import { Sparkles, Trash2, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2 } from 'lucide-react';
+import { Sidebar } from './components/Sidebar';
+import type { Candidate } from './components/Sidebar';
+import { ActivityLog } from './components/ActivityLog';
+import type { LogEntry } from './components/ActivityLog';
+import type { CardType } from './components/Card';
+import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
+
+// Map browser locale → display currency. Falls back to USD.
+const REGION_CURRENCY: Record<string, string> = {
+  US: 'USD', GB: 'GBP', JP: 'JPY', CN: 'CNY', IN: 'INR',
+  CA: 'CAD', AU: 'AUD', NZ: 'NZD', CH: 'CHF', KR: 'KRW',
+  BR: 'BRL', MX: 'MXN', SE: 'SEK', NO: 'NOK', DK: 'DKK',
+  DE: 'EUR', FR: 'EUR', IT: 'EUR', ES: 'EUR', NL: 'EUR',
+  IE: 'EUR', AT: 'EUR', BE: 'EUR', PT: 'EUR', FI: 'EUR',
+};
+function detectCurrency(): string {
+  try {
+    const lang = navigator.language || 'en-US';
+    const region = (lang.split('-')[1] || 'US').toUpperCase();
+    return REGION_CURRENCY[region] || 'USD';
+  } catch {
+    return 'USD';
+  }
+}
+const USER_CURRENCY = detectCurrency();
 
 interface Toast {
   id: string;
@@ -24,6 +46,13 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [isStagingUrl, setIsStagingUrl] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [logOpen, setLogOpen] = useState(true);
+  const [canvasOffset, setCanvasOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // dnd-kit: require 5px of movement before starting a drag — so clicks on
+  // buttons inside cards (expand, delete) work normally without triggering drag.
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
   // 1. Load from LocalStorage or initialize with 4 premium demo cards
   useEffect(() => {
@@ -156,16 +185,9 @@ export default function App() {
     if (!active) return;
 
     setCards((prevCards) =>
-      prevCards.map((card) => {
-        if (card.id === active.id) {
-          return {
-            ...card,
-            x: Math.max(10, Math.min(card.x + delta.x, 800)),
-            y: Math.max(10, Math.min(card.y + delta.y, 800)),
-          };
-        }
-        return card;
-      })
+      prevCards.map((card) =>
+        card.id === active.id ? { ...card, x: card.x + delta.x, y: card.y + delta.y } : card,
+      ),
     );
   };
 
@@ -196,30 +218,49 @@ export default function App() {
     }
   };
 
-  // File uploading (Snapshot / .eml file)
+  // File uploading (image / .eml)
   const handleIngestFile = async (file: File) => {
     try {
+      console.log('[ingest] file received', { name: file.name, type: file.type, size: file.size });
+      let previewDataUrl: string | null = null;
+      if (file.type.startsWith('image/')) {
+        previewDataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        console.log('[ingest] dataURL captured', {
+          start: previewDataUrl.slice(0, 60),
+          length: previewDataUrl.length,
+        });
+      }
+
       const formData = new FormData();
       formData.append('file', file);
-      
-      // If file ends with .eml, send an email hint
       if (file.name.endsWith('.eml')) {
         formData.append('hint', 'email');
       }
 
       const response = await fetch(`${API_BASE}/ingest`, {
         method: 'POST',
-        body: formData, // Automatically handled as multipart/form-data
+        body: formData,
       });
 
       if (!response.ok) throw new Error('File ingest failed');
       const card: CardType = await response.json();
-      
+
+      // Frontend is authoritative for uploaded images.
+      if (previewDataUrl) {
+        card.type = 'image';
+        card.cover_image = previewDataUrl;
+      }
+
       card.x = 100 + Math.random() * 200;
       card.y = 100 + Math.random() * 200;
-      
+
       setCards((prev) => [...prev, card]);
-      showToast(`Multimodal uploaded ${card.type} card: "${card.title}"`, 'success');
+      showToast(`Uploaded ${card.type} card: "${card.title}"`, 'success');
     } catch (err) {
       showToast('Failed to upload and ingest file', 'error');
       console.error(err);
@@ -234,22 +275,21 @@ export default function App() {
 
   // Suggestions panel actions
   const handleAddSuggestion = (candidate: Candidate) => {
-    // Map suggestion Candidate to CardType
     const newCard: CardType = {
       id: Math.random().toString(36).substr(2, 9),
-      type: 'link', // Suggestions default to product/excursion link cards
+      type: 'link',
       title: candidate.title,
       summary: candidate.match_reason,
       entities: ['scouted', 'suggestion'],
       url: candidate.url,
+      cover_image: candidate.image_url,
       x: 200 + Math.random() * 200,
       y: 200 + Math.random() * 200,
     };
-    
-    // Add to board and remove from suggestions
+
     setCards((prev) => [...prev, newCard]);
     setSuggestions((prev) => prev.filter((s) => s.url !== candidate.url));
-    showToast(`Added suggestion: "${candidate.title}" to board`, 'success');
+    showToast(`Added: "${candidate.title}"`, 'success');
   };
 
   const handleDismissSuggestion = (url: string) => {
@@ -326,13 +366,13 @@ export default function App() {
         
         // Map dispatches into ScoutRequests for batch scouting
         const scoutRequests = orchestrateData.scout_dispatches.map((dispatch: any) => {
-          // Find cluster label
           const matchedCluster = curateData.clusters.find((c: any) => c.id === dispatch.cluster_id);
           return {
             cluster_id: dispatch.cluster_id,
             cluster_label: matchedCluster ? matchedCluster.label : 'Style Cluster',
             search_hints: dispatch.search_hints,
             taste_profile: curateData.taste_profile,
+            user_currency: USER_CURRENCY,
           };
         });
 
@@ -368,116 +408,149 @@ export default function App() {
   };
 
   return (
-    <DndContext onDragEnd={handleDragEnd}>
+    <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
       
-      {/* Toast Notification Container */}
+      {/* Toasts */}
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 pointer-events-none max-w-sm">
         {toasts.map((toast) => (
           <div
             key={toast.id}
-            className={`flex items-center gap-2.5 px-4 py-3 rounded-xl border shadow-2xl backdrop-blur-md animate-fade-in pointer-events-auto ${
+            className={`flex items-center gap-2.5 px-4 py-3 rounded-lg border shadow-md animate-fade-in pointer-events-auto bg-[#FAF4E4] ${
               toast.type === 'success'
-                ? 'bg-emerald-950/80 border-emerald-500/20 text-emerald-300'
+                ? 'border-[#7A8B6E]/50 text-[#4A5A3E]'
                 : toast.type === 'error'
-                ? 'bg-rose-950/80 border-rose-500/20 text-rose-300'
+                ? 'border-[#A85E40]/50 text-[#6E3F2A]'
                 : toast.type === 'warning'
-                ? 'bg-amber-950/80 border-amber-500/20 text-amber-300'
-                : 'bg-indigo-950/80 border-indigo-500/20 text-indigo-300'
+                ? 'border-[#C9974A]/50 text-[#7E5A24]'
+                : 'border-[#D4C5AC] text-stone-700'
             }`}
           >
-            {toast.type === 'success' && <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />}
-            {toast.type === 'error' && <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />}
-            {toast.type === 'warning' && <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />}
-            {toast.type === 'info' && <Info className="w-4 h-4 text-indigo-400 shrink-0" />}
-            <span className="text-[11.5px] font-sans font-medium">{toast.message}</span>
+            {toast.type === 'success' && <CheckCircle className="w-4 h-4 text-[#7A8B6E] shrink-0" />}
+            {toast.type === 'error' && <AlertTriangle className="w-4 h-4 text-[#A85E40] shrink-0" />}
+            {toast.type === 'warning' && <AlertTriangle className="w-4 h-4 text-[#C9974A] shrink-0" />}
+            {toast.type === 'info' && <Info className="w-4 h-4 text-stone-600 shrink-0" />}
+            <span className="text-[11.5px] font-medium">{toast.message}</span>
           </div>
         ))}
       </div>
 
-      {/* Main Page Layout */}
-      <div className="w-screen h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden font-sans p-4 gap-4">
-        
-        {/* Header Navigation Section */}
-        <header className="flex justify-between items-center bg-slate-900/40 border border-white/5 rounded-2xl px-5 py-3.5 glass-panel shrink-0 select-none">
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-indigo-600/10 border border-indigo-500/20 text-indigo-400 shadow-[0_0_15px_rgba(99,102,241,0.1)]">
-              <Sparkles className="w-5 h-5" />
-            </div>
-            <div className="flex flex-col">
-              <h1 id="moodboard-heading" className="text-sm font-bold tracking-tight text-white uppercase tracking-widest">
-                Moodboard Spatial Canvas
-              </h1>
-              <p className="text-[10px] text-slate-500 font-medium">
-                Multi-Agent Web scouting & cart staging engine
-              </p>
-            </div>
-          </div>
+      {/* Full-bleed infinite canvas root */}
+      <div className="w-screen h-screen relative paper-bg text-stone-800 overflow-hidden">
 
-          {/* Action buttons */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleResetBoard}
-              className="px-3 py-1.5 rounded-lg border border-white/5 text-[11px] font-semibold text-slate-400 hover:text-slate-200 hover:bg-white/5 transition-all flex items-center gap-1.5"
-              title="Reset board to demo cards"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Reset</span>
-            </button>
-            <button
-              onClick={handleTickPipeline}
-              disabled={loading}
-              className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-[11px] font-bold text-white shadow-lg hover:shadow-indigo-500/25 transition-all disabled:opacity-50 flex items-center gap-1.5"
-              title="Trigger curate and dispatch scouts"
-            >
-              {loading ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>Curating...</span>
-                </>
-              ) : (
-                <>
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Tick Pipeline</span>
-                </>
-              )}
-            </button>
+        {/* Canvas fills everything behind */}
+        <div className="absolute inset-0 z-0">
+          <Canvas
+            cards={cards}
+            onRemoveCard={handleRemoveCard}
+            offset={canvasOffset}
+            onPanChange={setCanvasOffset}
+          />
+        </div>
+
+        {/* Floating header (top-left) */}
+        <header className="absolute top-4 left-4 z-30 flex items-center gap-3 panel-surface rounded-lg px-4 py-2.5 select-none pointer-events-auto">
+          <div className="p-1.5 rounded-md bg-[#C77B5C]/15 border border-[#C77B5C]/40 text-[#C77B5C]">
+            <Sparkles className="w-4 h-4" />
+          </div>
+          <div className="flex flex-col">
+            <h1 className="text-xs font-bold tracking-widest text-stone-800 uppercase">
+              Moodboard
+            </h1>
+            <p className="text-[10px] text-stone-500 font-medium">
+              Multi-agent scouting · live Chrome orchestration
+            </p>
           </div>
         </header>
 
-        {/* Dashboard workspace grid */}
-        <div className="flex-1 flex gap-4 min-h-0 overflow-hidden">
-          
-          {/* Main workspace section (Canvas & Dropzone) */}
-          <div className="flex-1 flex flex-col gap-4 min-h-0">
-            {/* The absolute canvas container */}
-            <div className="flex-1 min-h-0">
-              <Canvas cards={cards} onRemoveCard={handleRemoveCard} />
-            </div>
-            
-            {/* The ingestion dropzone */}
-            <div className="shrink-0">
-              <DropZone onIngestText={handleIngestText} onIngestFile={handleIngestFile} />
-            </div>
-          </div>
-
-          {/* Right sidebar pane */}
-          <div className="w-[320px] shrink-0 min-h-0 flex flex-col">
-            <Sidebar
-              tasteProfile={tasteProfile}
-              gaps={gaps}
-              suggestions={suggestions}
-              onAddSuggestion={handleAddSuggestion}
-              onDismissSuggestion={handleDismissSuggestion}
-              onStageSuggestion={handleStageSuggestion}
-              isStagingUrl={isStagingUrl}
-            />
-          </div>
+        {/* Floating actions (top-right) */}
+        <div className="absolute top-4 right-4 z-30 flex items-center gap-2 pointer-events-auto">
+          <button
+            onClick={handleResetBoard}
+            className="px-3 py-1.5 rounded-md panel-surface text-[11px] font-semibold text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors flex items-center gap-1.5"
+            title="Reset board"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reset</span>
+          </button>
+          <button
+            onClick={handleTickPipeline}
+            disabled={loading}
+            className="px-4 py-1.5 rounded-md bg-[#C77B5C] hover:bg-[#B26A4E] text-[11px] font-bold text-white transition-colors disabled:opacity-60 flex items-center gap-1.5 shadow"
+            title="Curate, orchestrate, scout"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>Working…</span>
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Tick pipeline</span>
+              </>
+            )}
+          </button>
         </div>
 
-        {/* Live streaming activities bar */}
-        <footer className="h-[160px] shrink-0">
+        {/* Right sidebar drawer */}
+        <aside
+          className={`absolute top-20 bottom-4 right-4 w-[340px] z-20 transition-transform duration-300 ease-out ${
+            sidebarOpen ? 'translate-x-0' : 'translate-x-[calc(100%+1rem)]'
+          }`}
+        >
+          <Sidebar
+            tasteProfile={tasteProfile}
+            gaps={gaps}
+            suggestions={suggestions}
+            onAddSuggestion={handleAddSuggestion}
+            onDismissSuggestion={handleDismissSuggestion}
+            onStageSuggestion={handleStageSuggestion}
+            isStagingUrl={isStagingUrl}
+          />
+        </aside>
+        <button
+          onClick={() => setSidebarOpen((o) => !o)}
+          className="absolute top-1/2 -translate-y-1/2 z-30 panel-surface px-1.5 py-3 rounded-l-md hover:bg-[#EDE0C6] transition-all"
+          style={{ right: sidebarOpen ? '360px' : '16px' }}
+          title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+        >
+          {sidebarOpen ? <PanelRightClose className="w-4 h-4 text-stone-600" /> : <PanelRightOpen className="w-4 h-4 text-stone-600" />}
+        </button>
+
+        {/* Bottom activity log drawer */}
+        <footer
+          className={`absolute left-4 z-20 transition-all duration-300 ease-out h-[200px] ${
+            logOpen ? 'bottom-4 opacity-100' : 'bottom-4 translate-y-[calc(100%+1rem)] opacity-0 pointer-events-none'
+          }`}
+          style={{ right: sidebarOpen ? '360px' : '16px' }}
+        >
           <ActivityLog logs={logs} onClearLogs={() => setLogs([])} />
         </footer>
+        <button
+          onClick={() => setLogOpen((o) => !o)}
+          className="absolute z-30 panel-surface px-3 py-1.5 rounded-t-md hover:bg-[#EDE0C6] transition-all flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-stone-600"
+          style={{
+            left: '16px',
+            bottom: logOpen ? '208px' : '0',
+          }}
+          title={logOpen ? 'Hide activity log' : 'Show activity log'}
+        >
+          {logOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
+          <span>Activity</span>
+        </button>
+
+        {/* Floating dropzone pill (bottom-center) */}
+        <div
+          className="absolute z-30 transition-all duration-300 ease-out pointer-events-auto"
+          style={{
+            left: '50%',
+            transform: 'translateX(-50%)',
+            bottom: logOpen ? '224px' : '16px',
+            width: 'min(640px, calc(100% - 4rem))',
+          }}
+        >
+          <DropZone onIngestText={handleIngestText} onIngestFile={handleIngestFile} />
+        </div>
 
       </div>
     </DndContext>

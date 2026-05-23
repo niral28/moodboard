@@ -9,6 +9,7 @@ class Card(BaseModel):
     summary: str = Field(description="A short 1-2 sentence aesthetic/content summary of the item")
     entities: List[str] = Field(default_factory=list, description="Aesthetic tags, colors, themes, materials, or brands")
     url: Optional[str] = Field(None, description="Source URL or Image URL if applicable")
+    cover_image: Optional[str] = Field(None, description="Displayable preview image (data URL for uploads, og:image for links, or direct image URL)")
     visual_features: Optional[str] = Field(None, description="Visual description (colors, texture, shape) if image/visual link")
     
     # Email specific first-class fields
@@ -67,6 +68,7 @@ class ScoutRequest(BaseModel):
     cluster_label: str
     search_hints: List[str]
     taste_profile: str
+    user_currency: Optional[str] = Field("USD", description="3-letter ISO currency code for displaying prices")
 
 class ScoutResponse(BaseModel):
     candidates: List[Candidate] = Field(description="List of scouted suggestions")

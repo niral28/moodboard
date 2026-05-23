@@ -1,496 +1,628 @@
 import os
 import json
 import uuid
+import base64
 import logging
 import asyncio
 from datetime import datetime
-from typing import List, Optional, Dict, Any
-import google.generativeai as genai
+from typing import List, Optional, Dict, Any, Tuple
+
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
 from models import (
-    Card, IngestRequest, Cluster, CurateRequest, CurateResponse,
-    ScoutDispatch, OrchestrateRequest, OrchestrateResponse,
-    Candidate, ScoutRequest, ScoutResponse, StageRequest, StageResponse
+    Card, Cluster, CurateResponse,
+    ScoutDispatch, OrchestrateResponse,
+    Candidate, ScoutResponse, StageResponse,
 )
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("moodboard.agents")
 
-# Initialize GenAI
-api_key = os.environ.get("GEMINI_API_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
-else:
-    logger.warning("GEMINI_API_KEY environment variable is not set. Real Gemini API calls will fail.")
+# --- SDK client ---
+_api_key = os.environ.get("GEMINI_API_KEY")
+client: Optional[genai.Client] = genai.Client(api_key=_api_key) if _api_key else None
+if client is None:
+    logger.warning("GEMINI_API_KEY not set — agents will return mock data.")
 
-# In-memory streaming activity log queue
+MODEL = "gemini-3.5-flash"
+THINKING = types.ThinkingConfig(thinking_budget=-1)  # dynamic; the model decides depth
+
+# --- Activity log / SSE plumbing ---
 event_logs: List[Dict[str, Any]] = []
 event_queue: asyncio.Queue = asyncio.Queue()
 
-def append_log(agent: str, message: str, level: str = "info"):
-    """
-    Appends a new log to the list and pushes it to the SSE event queue.
-    """
+
+def _fetch_og_image(url: str, timeout: float = 3.0) -> Optional[str]:
+    """Fast HTTP-only og:image fetch. Returns absolute URL or None. Used for static sites
+    (most editorial, retail, booking). SPAs (Instagram, X, etc.) need the browser fallback."""
+    try:
+        import re
+        import requests
+        from urllib.parse import urljoin
+
+        r = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                "Accept": "text/html",
+            },
+            allow_redirects=True,
+        )
+        if r.status_code != 200 or "text/html" not in r.headers.get("Content-Type", ""):
+            return None
+        html = r.text[:300_000]
+        patterns = [
+            r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                return urljoin(url, m.group(1))
+        return None
+    except Exception as e:
+        logger.warning(f"og:image fetch failed for {url}: {e}")
+        return None
+
+
+# Headless Chromium fallback for pages without og:image (Instagram, X, SPAs).
+# Captures a real screenshot of the rendered page. Concurrency-limited so we
+# never spawn more than a few Chromium instances in parallel.
+_BROWSER_FETCH_SEMA = asyncio.Semaphore(3)
+
+
+async def _screenshot_page_via_browser(url: str, timeout_ms: int = 10000) -> Optional[str]:
+    """Returns a data:image/jpeg URL of the rendered viewport, or None on failure.
+    Requires `playwright install chromium` to be done once in this venv."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return None
+
+    async with _BROWSER_FETCH_SEMA:
+        try:
+            async with async_playwright() as p:
+                try:
+                    browser = await p.chromium.launch(headless=True)
+                except Exception as e:
+                    logger.warning(
+                        f"Headless Chromium unavailable ({e}). "
+                        "Run: backend/.venv/bin/playwright install chromium"
+                    )
+                    return None
+                try:
+                    ctx = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                        ),
+                        viewport={"width": 1280, "height": 800},
+                    )
+                    page = await ctx.new_page()
+                    try:
+                        await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                        # Give SPAs a beat to paint above-the-fold content.
+                        await page.wait_for_timeout(1500)
+                        png_bytes = await page.screenshot(type="jpeg", quality=75, full_page=False)
+                        b64 = base64.b64encode(png_bytes).decode("ascii")
+                        return f"data:image/jpeg;base64,{b64}"
+                    finally:
+                        await ctx.close()
+                finally:
+                    await browser.close()
+        except Exception as e:
+            logger.warning(f"Screenshot fetch failed for {url}: {e}")
+            return None
+
+
+async def _resolve_cover_image(url: str) -> Optional[str]:
+    """Two-tier preview resolver: fast og:image scrape → headless screenshot fallback."""
+    if not url or not url.startswith("http"):
+        return None
+    loop = asyncio.get_running_loop()
+    og = await loop.run_in_executor(None, _fetch_og_image, url)
+    if og:
+        return og
+    return await _screenshot_page_via_browser(url)
+
+
+def append_log(agent: str, message: str, level: str = "info", details: Optional[str] = None):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = {
-        "agent": agent,
-        "message": message,
-        "level": level,
-        "timestamp": timestamp
-    }
-    event_logs.append(log_entry)
-    
-    # Safely push to the asyncio queue
+    entry: Dict[str, Any] = {"agent": agent, "message": message, "level": level, "timestamp": timestamp}
+    if details:
+        entry["details"] = details
+    event_logs.append(entry)
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            loop.call_soon_threadsafe(event_queue.put_nowait, log_entry)
+            loop.call_soon_threadsafe(event_queue.put_nowait, entry)
     except RuntimeError:
-        # Loop not running yet, just queue synchronously (main thread startup)
-        event_queue.put_nowait(log_entry)
+        event_queue.put_nowait(entry)
     except Exception as e:
-        logger.error(f"Error queueing log event: {e}")
-        
+        logger.error(f"queue error: {e}")
     logger.info(f"[{agent.upper()}] {message}")
 
-# --- AGENT 1: Ingest Agent ---
-async def run_ingest(content: str, hint: Optional[str] = None, image_bytes: Optional[bytes] = None, mime_type: Optional[str] = None) -> Card:
-    append_log("ingest", f"Starting ingestion pipeline. Hint: {hint or 'None'}", "info")
-    
-    if image_bytes:
-        append_log("ingest", f"Received binary image attachment ({len(image_bytes)} bytes) for multimodal parsing.", "info")
-    else:
-        content_preview = content[:80] + "..." if len(content) > 80 else content
-        append_log("ingest", f"Received text payload for ingest: '{content_preview}'", "info")
 
-    prompt = """
-Role: Universal Multimodal Ingest Analyst.
-Instructions:
-Analyze the input content (which may consist of text, a web link, or raw image bytes). 
-Identify the primary topic, item, or theme, and classify the card type into exactly one of 'text', 'link', 'image', or 'email'.
+async def _generate_structured(
+    prompt: str,
+    schema: type[BaseModel],
+    parts: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    contents: List[Any] = list(parts) if parts else []
+    contents.append(prompt)
+    response = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+            thinking_config=THINKING,
+        ),
+    )
+    return json.loads(response.text)
 
-Classification rules:
-1. If the input contains email headers (e.g. 'From:', 'Subject:', 'To:', 'Date:') OR contains typical email correspondence structure (greetings, signatures), OR if the caller explicitly hints 'email', classify it as 'email'.
-2. If the input is a web URL, classify as 'link'.
-3. If the input consists primarily of raw image bytes, or describes a pure image/visual artifact, classify as 'image'.
-4. Otherwise, classify as 'text'.
 
-Specific Extraction Guidelines:
-- For 'email' type cards:
-  * Extract 'sender' (the From field/sender email or name).
-  * Extract 'subject' (the Subject line).
-  * Extract 'date' (the Date of the email).
-  * Synthesize a concise 1-2 sentence 'body_summary' of the email body content.
-  * Set 'title' to the email subject line.
-  * Set 'summary' to a concise overview of the email context.
-- For all other cards:
-  * Synthesize a concise 'title' and a 1-2 sentence aesthetic 'summary' of the content's core characteristics.
-  * If the input is visual (raw image bytes or visual webpage), deconstruct the visual features (layout, color balance, lighting, textures, geometry) into 'visual_features'.
-- For all cards:
-  * Deconstruct the content into key 'entities' (such as material, color, mood, purpose, or context tags).
-  * Populate 'id' with a placeholder string 'temp_id'. We will generate a UUID on the backend.
-  * Ensure all required fields in the output schema are populated correctly.
+# ======================= INGEST =======================
+INGEST_PROMPT = """\
+Role: Multimodal ingest analyst for a creative moodboard.
+
+Input is heterogeneous: free text, a URL, raw image bytes, an email message, or any mix. Produce one Card describing the artifact.
+
+Choose `type` from the content's actual nature, not its surface form:
+- 'email' for correspondence (headers, salutations, signatures, conversational tone)
+- 'link' for content referenced by a URL
+- 'image' when the dominant payload is visual
+- 'text' otherwise
+
+A `hint` argument, when present, is a soft override — apply it only if the content is genuinely ambiguous.
+
+For email cards, populate sender, subject, date, and body_summary from the message itself. For visual cards, decompose `visual_features` along color palette, lighting, texture, material, geometry, and composition. For every card, derive `entities` that downstream search agents could actually act on — specific brands, materials, color names, locations, themes. Avoid generic tags ("image", "note", "idea").
+
+Aim for a title under 8 words and a summary of 1–2 sentences. Set `id` to "temp_id"; the backend will assign a UUID.
 """
 
-    if not api_key:
-        # Mock Ingestion if no API key
-        append_log("ingest", "No GEMINI_API_KEY found, running mock ingestion.", "warning")
-        await asyncio.sleep(1.0)
-        
-        card_id = str(uuid.uuid4())
-        if hint == "email" or "From:" in content or "Subject:" in content:
-            card = Card(
-                id=card_id,
-                type="email",
-                title="Mock Project Update Email",
-                summary="An email discussion detailing next week's travel logistics and agenda.",
-                entities=["logistics", "travel", "itinerary", "meeting"],
-                sender="sarah.jones@example.com",
-                subject="Project Trip Logistics & Tokyo Agenda",
-                date="2026-05-23",
-                body_summary="Summarizes flight departures, hotels in Gion, and meetings scheduled with partners.",
-                x=100.0,
-                y=100.0
-            )
-        elif content.startswith("http"):
-            card = Card(
-                id=card_id,
-                type="link",
-                title="Kyoto Excursion Guide",
-                summary="A curated walking guide to historic temples and serene bamboo pathways in Japan.",
-                entities=["Kyoto", "travel", "nature", "temple"],
-                url=content,
-                x=150.0,
-                y=150.0
-            )
-        elif image_bytes:
-            card = Card(
-                id=card_id,
-                type="image",
-                title="Dropped Canvas Asset",
-                summary="A beautiful, high-contrast visual snapshot depicting natural scenery.",
-                entities=["image", "aesthetic", "scenery", "outdoor"],
-                visual_features="Emerald greens, soft natural lighting, morning dew textures",
-                x=200.0,
-                y=200.0
-            )
-        else:
-            card = Card(
-                id=card_id,
-                type="text",
-                title="Text Note",
-                summary=content,
-                entities=["notes", "ideas", "general"],
-                x=100.0,
-                y=200.0
-            )
-        append_log("ingest", f"Mock ingestion successful. Created card '{card.title}' (ID: {card.id})", "success")
-        return card
 
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        contents = []
-        
-        if image_bytes:
-            contents.append({
-                "mime_type": mime_type or "image/jpeg",
-                "data": image_bytes
-            })
-            
-        contents.append(f"{prompt}\n\nUser Input: {content}\nType Hint: {hint or 'None'}")
-        
-        append_log("ingest", "Calling Gemini Flash API for card deconstruction...", "info")
-        
-        # We run the block in an executor to avoid blocking the async event loop
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(
-                contents,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=Card
-                )
-            )
-        )
-        
-        card_data = json.loads(response.text)
-        card_data["id"] = str(uuid.uuid4()) # Overwrite with real UUID
-        card = Card(**card_data)
-        
-        append_log("ingest", f"Gemini Flash deconstructed card successfully: '{card.title}' (Type: {card.type})", "success")
-        return card
-        
-    except Exception as e:
-        append_log("ingest", f"Ingestion agent failed: {str(e)}", "error")
-        # Fallback card
-        card_id = str(uuid.uuid4())
+async def run_ingest(
+    content: str,
+    hint: Optional[str] = None,
+    image_bytes: Optional[bytes] = None,
+    mime_type: Optional[str] = None,
+) -> Card:
+    append_log("ingest", f"Ingest start — hint={hint or 'none'}, image={'yes' if image_bytes else 'no'}.", "info")
+
+    if client is None:
+        append_log("ingest", "No API key — returning mock card.", "warning")
+        await asyncio.sleep(0.5)
         return Card(
-            id=card_id,
+            id=str(uuid.uuid4()),
             type="text",
-            title="Ingestion Error Card",
-            summary=f"Failed to ingest content: {str(e)}",
-            entities=["error"],
-            x=100.0,
-            y=100.0
+            title="Mock Note",
+            summary=content[:120] if content else "Placeholder card.",
+            entities=["mock"],
+            x=120.0, y=120.0,
         )
 
+    parts: List[Any] = []
+    if image_bytes:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"))
 
-# --- AGENT 2: Curate Agent ---
-async def run_curate(cards: List[Card]) -> CurateResponse:
-    append_log("curate", f"Starting curation. Reviewing {len(cards)} cards on the spatial board.", "info")
-    
-    if not cards:
-        append_log("curate", "No cards available to curate.", "warning")
-        return CurateResponse(clusters=[], taste_profile="Empty canvas waiting for inspiration.", gaps=[])
-
-    prompt = """
-Role: Creative Director, Curator, & Trend Analyst.
-Instructions:
-You are curating a highly customized visual workspace. 
-Analyze all provided moodboard cards. 
-Identify structural affinities, thematic overlaps, or shared stylistic/conceptual threads. 
-Organize all cards into distinct, labeled clusters. Every cluster must have a creative, highly descriptive label.
-Formulate a rich, narrative 'taste_profile' describing the overarching vibe, stylistic preferences, or conceptual motifs present across all cards.
-Analyze what is missing to elevate this canvas to its fullest potential and output 3-5 specific 'gaps' (concrete items, ideas, or topics) that would complement this collection.
-"""
-
-    if not api_key:
-        append_log("curate", "No GEMINI_API_KEY found, running mock curation.", "warning")
-        await asyncio.sleep(1.0)
-        
-        # Simple clustering based on type or entities
-        clusters = []
-        if len(cards) > 0:
-            clusters.append(Cluster(
-                id="cluster_1",
-                label="Primary Board Collection",
-                card_ids=[c.id for c in cards]
-            ))
-            
-        taste = "An eclectic collection of items representing structural travel references and conceptual text notes. Emphasizes creative exploration, organization, and visual texture."
-        gaps = [
-            "Specific reservation dates or flight confirmation documents",
-            "A structured timeline or calendar card to sequence these nodes",
-            "A visual imagery card representing scenic backdrops"
-        ]
-        
-        response = CurateResponse(clusters=clusters, taste_profile=taste, gaps=gaps)
-        append_log("curate", "Curation successful. Canvas clustered and taste profile updated.", "success")
-        return response
+    user_block = f"User input:\n{content}\n\nHint: {hint or 'none'}"
+    prompt = f"{INGEST_PROMPT}\n\n{user_block}"
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        cards_json = [c.model_dump() for c in cards]
-        
-        append_log("curate", "Sending board state to Gemini Flash for clustering and style extraction...", "info")
-        
-        loop = asyncio.get_running_loop()
-        response_data = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(
-                f"{prompt}\n\nMoodboard Cards JSON:\n{json.dumps(cards_json)}",
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=CurateResponse
-                )
-            )
-        )
-        
-        curate_res = CurateResponse(**json.loads(response_data.text))
-        append_log("curate", f"Curation complete. Formulated {len(curate_res.clusters)} clusters and identified {len(curate_res.gaps)} gaps.", "success")
-        return curate_res
-        
+        append_log("ingest", "Calling Gemini 3.5 Flash (thinking enabled)…", "info")
+        data = await _generate_structured(prompt, Card, parts=parts)
+        data["id"] = str(uuid.uuid4())
+        card = Card(**data)
+
+        # For link cards, try to fetch a preview image (og:image, falling back to
+        # a real headless-Chromium screenshot for SPAs without static metadata).
+        if card.type == "link" and card.url and not card.cover_image:
+            cover = await _resolve_cover_image(card.url)
+            if cover:
+                card.cover_image = cover
+                source = "og:image" if cover.startswith("http") else "page screenshot"
+                preview_detail = cover if cover.startswith("http") else "[base64 jpeg attached to card]"
+                append_log("ingest", f"Captured preview ({source}) for '{card.title}'.", "info", details=preview_detail)
+
+        append_log("ingest", f"Card created: '{card.title}' (type={card.type}).", "success")
+        return card
     except Exception as e:
-        append_log("curate", f"Curation agent failed: {str(e)}", "error")
-        # Fallback curate response
-        return CurateResponse(
-            clusters=[Cluster(id="fallback_cl", label="Unsorted Collection", card_ids=[c.id for c in cards])],
-            taste_profile="General creative collection.",
-            gaps=["Add more visual assets or links to start discovery."]
+        append_log("ingest", f"Ingest failed: {e}", "error")
+        return Card(
+            id=str(uuid.uuid4()), type="text",
+            title="Ingestion Error", summary=str(e), entities=["error"],
+            x=100.0, y=100.0,
         )
 
 
-# --- AGENT 3: Orchestrate Agent ---
+# ======================= CURATE =======================
+CURATE_PROMPT = """\
+Role: Creative director synthesizing a moodboard.
+
+You receive every card on the user's canvas — heterogeneous, possibly contradictory, possibly sparse. When image cards are present, their actual pixel data is attached above the JSON; look at the images directly, not just the text descriptions, when deciding how they group and what they say about the user.
+
+Identify the dominant aesthetic, narrative, or planning intent. Cluster cards by what *unites* them at a deeper level than card type — shared mood, material palette, geographic locus, conceptual thread, or stage of a plan. A single card may anchor a cluster on its own if it represents a distinct strand. Label each cluster with a phrase a designer would instantly recognize; flat category names ("Travel", "Notes", "Ideas") are not useful.
+
+Articulate `taste_profile` as a paragraph the user would recognize as describing them — the underlying sensibility and direction, not a list of items.
+
+Identify `gaps` as 3–5 concrete additions whose absence is conspicuous given the rest of the board. Gaps must be specific enough that a search agent can act on them directly — name materials, places, price tiers, or formats where the existing cards make those constraints explicit.
+"""
+
+
+def _extract_image_parts(cards: List[Card]) -> Tuple[List[Any], List[Card]]:
+    """Pull data:image/* URLs off image cards and return Gemini image Parts +
+    a sanitized card list (with the bulky data URL replaced by a reference)."""
+    parts: List[Any] = []
+    sanitized: List[Card] = []
+    for c in cards:
+        url = c.url or ""
+        if c.type == "image" and url.startswith("data:image/"):
+            try:
+                header, b64 = url.split(",", 1)
+                mime = header.split(";")[0].replace("data:", "") or "image/jpeg"
+                img_bytes = base64.b64decode(b64)
+                parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+                parts.append(f"^^^ Image above is card id={c.id}, title='{c.title}'")
+                clone = c.model_copy(update={"url": f"(image attached above as card {c.id})"})
+                sanitized.append(clone)
+                continue
+            except Exception as e:
+                logger.warning(f"Failed to decode image card {c.id}: {e}")
+        sanitized.append(c)
+    return parts, sanitized
+
+
+async def run_curate(cards: List[Card]) -> CurateResponse:
+    append_log("curate", f"Curate start — {len(cards)} cards on board.", "info")
+
+    if not cards:
+        append_log("curate", "Empty canvas — nothing to curate.", "warning")
+        return CurateResponse(clusters=[], taste_profile="Empty canvas.", gaps=[])
+
+    if client is None:
+        append_log("curate", "No API key — returning mock curation.", "warning")
+        await asyncio.sleep(0.5)
+        return CurateResponse(
+            clusters=[Cluster(id="mock_cl", label="Unsorted", card_ids=[c.id for c in cards])],
+            taste_profile="Mock taste profile.",
+            gaps=["Mock gap 1", "Mock gap 2"],
+        )
+
+    image_parts, sanitized_cards = _extract_image_parts(cards)
+    if image_parts:
+        n_images = sum(1 for p in image_parts if not isinstance(p, str))
+        append_log("curate", f"Attaching {n_images} image(s) for direct visual analysis.", "info")
+
+    cards_json = [c.model_dump() for c in sanitized_cards]
+    prompt = f"{CURATE_PROMPT}\n\nBoard cards (JSON, image cards' pixel data attached above):\n{json.dumps(cards_json, indent=2)}"
+
+    try:
+        append_log("curate", "Calling Gemini 3.5 Flash for clustering + taste synthesis…", "info")
+        data = await _generate_structured(prompt, CurateResponse, parts=image_parts or None)
+        res = CurateResponse(**data)
+        append_log("curate", f"Curated into {len(res.clusters)} clusters, {len(res.gaps)} gaps.", "success")
+        return res
+    except Exception as e:
+        append_log("curate", f"Curate failed: {e}", "error")
+        return CurateResponse(
+            clusters=[Cluster(id="fallback", label="Unsorted Collection", card_ids=[c.id for c in cards])],
+            taste_profile="Curation unavailable.",
+            gaps=[],
+        )
+
+
+# ======================= ORCHESTRATE =======================
+ORCHESTRATE_PROMPT = """\
+Role: Research coordinator routing scout agents.
+
+You receive the curator's clusters, taste profile, and identified gaps. Produce one dispatch per cluster that would benefit from enrichment (or per gap, when a gap doesn't map cleanly to a cluster).
+
+Assign `priority` by leverage:
+- 'high' when filling it unblocks a decision the user is clearly trying to make
+- 'medium' when it meaningfully extends an existing thread
+- 'low' for decorative enrichment
+
+Write 2–4 `search_hints` per dispatch as queries a human researcher could paste into a search engine. Include the specific qualifiers the curation supplies — materials, brand names, geographic locations, price tiers, date windows. Avoid generic queries like "design ideas" or "travel tips"; the scout will fail to ground them.
+"""
+
+
 async def run_orchestrate(clusters: List[Cluster], taste_profile: str, gaps: List[str]) -> OrchestrateResponse:
-    append_log("orchestrate", f"Starting orchestration. Clusters: {len(clusters)}, Gaps: {len(gaps)}.", "info")
-    
+    append_log("orchestrate", f"Orchestrate start — {len(clusters)} clusters, {len(gaps)} gaps.", "info")
+
     if not clusters:
-        append_log("orchestrate", "No clusters found, dispatching empty scout list.", "warning")
+        append_log("orchestrate", "No clusters — no dispatches.", "warning")
         return OrchestrateResponse(scout_dispatches=[])
 
-    prompt = """
-Role: Design Studio Director & Research Coordinator.
-Instructions:
-Analyze the curation output: the current clusters, the synthesized taste profile, and the identified gaps.
-Design targeted scouting dispatches ('scout_dispatches') to enrich each cluster or bridge the identified style/content gaps.
-For each dispatch, assign a logical priority ('high', 'medium', or 'low') and synthesize a list of highly descriptive, specific search queries ('search_hints') designed to uncover relevant products, references, itineraries, or items.
-These dispatches will be routed to e-commerce or information scouts to find highly precise aesthetic matches.
-"""
+    if client is None:
+        append_log("orchestrate", "No API key — returning mock dispatches.", "warning")
+        await asyncio.sleep(0.5)
+        return OrchestrateResponse(scout_dispatches=[
+            ScoutDispatch(cluster_id=c.id, priority="medium", search_hints=[f"explore {c.label}"])
+            for c in clusters
+        ])
 
-    if not api_key:
-        append_log("orchestrate", "No GEMINI_API_KEY found, running mock orchestration.", "warning")
-        await asyncio.sleep(1.0)
-        
-        dispatches = []
-        for cluster in clusters:
-            dispatches.append(ScoutDispatch(
-                cluster_id=cluster.id,
-                priority="high",
-                search_hints=[f"explore {cluster.label} travel options", f"top rated attractions in {cluster.label}"]
-            ))
-            
-        response = OrchestrateResponse(scout_dispatches=dispatches)
-        append_log("orchestrate", f"Orchestration complete. Dispatched {len(dispatches)} scout requests.", "success")
-        return response
+    payload = {
+        "clusters": [c.model_dump() for c in clusters],
+        "taste_profile": taste_profile,
+        "gaps": gaps,
+    }
+    prompt = f"{ORCHESTRATE_PROMPT}\n\nCuration state:\n{json.dumps(payload, indent=2)}"
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        payload = {
-            "clusters": [cl.model_dump() for cl in clusters],
-            "taste_profile": taste_profile,
-            "gaps": gaps
-        }
-        
-        append_log("orchestrate", "Coordinating dispatches using Gemini Flash...", "info")
-        
-        loop = asyncio.get_running_loop()
-        response_data = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(
-                f"{prompt}\n\nCuration State Payload:\n{json.dumps(payload)}",
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=OrchestrateResponse
-                )
-            )
-        )
-        
-        orchestrate_res = OrchestrateResponse(**json.loads(response_data.text))
-        append_log("orchestrate", f"Orchestration completed. Planned {len(orchestrate_res.scout_dispatches)} scout dispatches.", "success")
-        return orchestrate_res
-        
+        append_log("orchestrate", "Calling Gemini 3.5 Flash for dispatch planning…", "info")
+        data = await _generate_structured(prompt, OrchestrateResponse)
+        res = OrchestrateResponse(**data)
+        append_log("orchestrate", f"Planned {len(res.scout_dispatches)} scout dispatches.", "success")
+        return res
     except Exception as e:
-        append_log("orchestrate", f"Orchestration agent failed: {str(e)}", "error")
-        # Fallback
-        dispatches = [ScoutDispatch(cluster_id=c.id, priority="medium", search_hints=["aesthetic inspirations"]) for c in clusters]
-        return OrchestrateResponse(scout_dispatches=dispatches)
+        append_log("orchestrate", f"Orchestrate failed: {e}", "error")
+        return OrchestrateResponse(scout_dispatches=[
+            ScoutDispatch(cluster_id=c.id, priority="medium", search_hints=["aesthetic inspirations"])
+            for c in clusters
+        ])
 
 
-# --- AGENT 4: Scout Agent ---
-async def run_scout_single(dispatch: ScoutDispatch, taste_profile: str, cluster_label: str) -> List[Candidate]:
-    """
-    Runs a single scout agent for a specific dispatch. Pushes detailed logs to SSE.
-    """
-    append_log("scout", f"Dispatching Scout for cluster '{cluster_label}' (ID: {dispatch.cluster_id}). Priority: {dispatch.priority.upper()}.", "info")
-    
-    hints_str = ", ".join([f"'{h}'" for h in dispatch.search_hints])
-    append_log("scout", f"Scouting hints: {hints_str}", "info")
-    
-    prompt = """
-Role: Intelligent Product & Reference Scout.
-Instructions:
-Given a specific moodboard cluster, a set of search hints, and a user's overarching taste profile, act as an expert scout.
-Use your deep knowledge base to discover, simulate, or retrieve 3 highly relevant candidates (products, articles, tickets, or bookings) that address the search hints and align with the user's taste profile.
-For each candidate:
-- Provide a title.
-- Provide a relevant URL (e.g. from major travel, shopping, booking, or design domains).
-- Provide a price (e.g. '$120' or '$40/ticket' or 'Free') if applicable.
-- Provide an image URL (use high-quality decorative Unsplash paths related to the item, or simple placeholders).
-- Write a highly detailed 'match_reason' explaining exactly how it fits the specified taste profile and complements the cluster.
+# ======================= SCOUT =======================
+SCOUT_PROMPT = """\
+Role: Product and reference scout with live web search.
+
+You receive one cluster, its search hints, the user's overall taste profile, and the user's preferred display currency. Perform real web research with your search tool and surface exactly 3 candidates that would meaningfully extend the moodboard. Candidates may be products, articles, bookings, references, or images — whichever best satisfies the hints in context.
+
+Ground each candidate in a real web source surfaced by the search tool — do not invent URLs. Lean on the most specific qualifier in each hint (a district, material, brand, price tier, date) when forming queries.
+
+Pricing: when a candidate is purchasable or bookable, format the price in the user's preferred currency. If the source price is in a different currency, convert at approximate current rates and show the converted figure first with the original in parentheses — e.g. "$40 (~¥6,000)". Do not omit a price the source clearly states.
+
+Return your answer as a JSON array of exactly 3 objects with these fields:
+- title: the candidate's actual name as it appears on the source page
+- url: the real, cited URL from your search results
+- price: string in the user's currency when purchasable/bookable, else null
+- image_url: representative image URL if you have one from the source, else null
+- match_reason: why this candidate fits, in terms specific enough that a skeptical user could verify — reference the cluster identity, the taste profile, or specific entities. Avoid generalities.
+
+Output only the JSON array. No commentary, no code fences.
 """
 
-    if not api_key:
-        append_log("scout", f"Scout mock running for '{cluster_label}'...", "info")
-        await asyncio.sleep(1.5)
-        
-        candidates = [
+
+CDP_ENDPOINT = "http://localhost:9222"
+
+
+async def _open_urls_in_chrome(urls: List[str], cluster_label: str) -> None:
+    """Open each URL as a new tab in the user's running Chrome via CDP.
+    Gracefully degrades with a log warning if Chrome is not reachable at CDP_ENDPOINT."""
+    if not urls:
+        return
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        append_log("scout", "Playwright not installed — skipping Chrome tab orchestration.", "warning")
+        return
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.connect_over_cdp(CDP_ENDPOINT)
+        except Exception as e:
+            append_log(
+                "scout",
+                f"Chrome CDP unreachable at {CDP_ENDPOINT} — tabs will not open.",
+                "warning",
+                details=(
+                    "To enable live tab orchestration, launch Chrome with:\n"
+                    "  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \\\n"
+                    "    --remote-debugging-port=9222 \\\n"
+                    "    --user-data-dir=\"$HOME/chrome-debug-profile2\"\n\n"
+                    f"Error: {e}"
+                ),
+            )
+            return
+
+        ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+        async def open_one(url: str):
+            try:
+                page = await ctx.new_page()
+                append_log("scout", f"Chrome → opening tab for '{cluster_label}': {url}", "info")
+                await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            except Exception as e:
+                append_log("scout", f"Chrome tab failed: {url}", "warning", details=str(e))
+
+        await asyncio.gather(*(open_one(u) for u in urls), return_exceptions=True)
+        await browser.close()  # disconnects CDP; tabs stay open
+
+
+async def _enrich_candidate_images(candidates: List[Candidate]) -> None:
+    """Fill in missing image_url for each candidate via og:image → screenshot fallback."""
+    async def enrich(c: Candidate):
+        if c.image_url and c.image_url.startswith("http"):
+            return
+        if not c.url or not c.url.startswith("http"):
+            return
+        cover = await _resolve_cover_image(c.url)
+        if cover:
+            c.image_url = cover
+
+    await asyncio.gather(*(enrich(c) for c in candidates), return_exceptions=True)
+
+
+def _extract_candidates(text: str, cited: List[Dict[str, str]]) -> List[Candidate]:
+    """Robustly extract candidate JSON from the grounded model output.
+    Falls back to a list synthesized from grounding citations if parsing fails."""
+    cleaned = text.strip()
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif cleaned.startswith("```"):
+        cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
+
+    candidates: List[Candidate] = []
+    try:
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        raw = cleaned[start:end + 1] if start >= 0 and end > start else cleaned
+        data = json.loads(raw)
+        if isinstance(data, dict) and "candidates" in data:
+            data = data["candidates"]
+        for item in data[:3]:
+            candidates.append(Candidate(**item))
+    except Exception:
+        for c in cited[:3]:
+            candidates.append(Candidate(
+                title=c.get("title") or "Source",
+                url=c["url"],
+                price=None,
+                image_url=None,
+                match_reason="Surfaced via grounded web search for this cluster.",
+            ))
+    return candidates
+
+
+async def run_scout_single(
+    dispatch: ScoutDispatch,
+    taste_profile: str,
+    cluster_label: str,
+    user_currency: str = "USD",
+) -> List[Candidate]:
+    append_log(
+        "scout",
+        f"Scout dispatched for '{cluster_label}' (priority={dispatch.priority}, currency={user_currency}).",
+        "info",
+        details="Search hints:\n- " + "\n- ".join(dispatch.search_hints),
+    )
+
+    if client is None:
+        append_log("scout", "No API key — returning mock candidates.", "warning")
+        await asyncio.sleep(0.5)
+        return [
             Candidate(
-                title=f"Scenic {cluster_label} Hotel & Inn",
-                url="https://example.com/boutique-hotel",
-                price="$220/night",
-                image_url="https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?auto=format&fit=crop&w=400&q=80",
-                match_reason=f"Perfect match for the taste profile. Complements your visual boards for '{cluster_label}' with classic style."
-            ),
-            Candidate(
-                title=f"Aesthetic Cafe & Workspace",
-                url="https://example.com/local-cafe",
-                price="$10",
-                image_url="https://images.unsplash.com/photo-1501339847302-ac426a4a7cbb?auto=format&fit=crop&w=400&q=80",
-                match_reason="Matches your interest in cozy, high-design local settings for work and relaxation."
-            ),
-            Candidate(
-                title=f"Curated Scenic City Walk tour",
-                url="https://example.com/city-walk",
-                price="$45/person",
+                title=f"Mock candidate for {cluster_label}",
+                url="https://example.com/mock",
+                price="$100",
                 image_url="https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?auto=format&fit=crop&w=400&q=80",
-                match_reason="Provides an organized itinerary node satisfying the aesthetic search hints."
+                match_reason="Mock match reason.",
             )
         ]
-        append_log("scout", f"Scout found 3 mock candidates for cluster '{cluster_label}'.", "success")
-        return candidates
+
+    payload = {
+        "cluster_label": cluster_label,
+        "search_hints": dispatch.search_hints,
+        "taste_profile": taste_profile,
+        "user_currency": user_currency,
+    }
+    prompt = f"{SCOUT_PROMPT}\n\nScout brief:\n{json.dumps(payload, indent=2)}"
+
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        thinking_config=types.ThinkingConfig(include_thoughts=True, thinking_budget=-1),
+    )
+
+    full_text = ""
+    cited: List[Dict[str, str]] = []
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        payload = {
-            "cluster_id": dispatch.cluster_id,
-            "cluster_label": cluster_label,
-            "search_hints": dispatch.search_hints,
-            "taste_profile": taste_profile
-        }
-        
-        loop = asyncio.get_running_loop()
-        response_data = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(
-                f"{prompt}\n\nScout Specification Payload:\n{json.dumps(payload)}",
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=ScoutResponse
-                )
-            )
+        stream = await client.aio.models.generate_content_stream(
+            model=MODEL,
+            contents=prompt,
+            config=config,
         )
-        
-        scout_res = ScoutResponse(**json.loads(response_data.text))
-        append_log("scout", f"Scout successfully completed task for '{cluster_label}'. Retrieved {len(scout_res.candidates)} curated candidates.", "success")
-        return scout_res.candidates
-        
+        async for chunk in stream:
+            for cand in (chunk.candidates or []):
+                if cand.content and cand.content.parts:
+                    for part in cand.content.parts:
+                        is_thought = bool(getattr(part, "thought", False))
+                        text = getattr(part, "text", None) or ""
+                        if is_thought and text.strip():
+                            first_line = text.strip().split("\n", 1)[0]
+                            headline = first_line[:120] + ("…" if len(first_line) > 120 else "")
+                            append_log(
+                                "scout",
+                                f"[thinking] {headline}",
+                                "info",
+                                details=text.strip(),
+                            )
+                        elif text:
+                            full_text += text
+                gm = getattr(cand, "grounding_metadata", None)
+                if gm and getattr(gm, "grounding_chunks", None):
+                    for gc in gm.grounding_chunks:
+                        web = getattr(gc, "web", None)
+                        if web and getattr(web, "uri", None):
+                            cited.append({"url": web.uri, "title": getattr(web, "title", "") or ""})
+
+        # De-dupe cited URLs preserving order
+        seen = set()
+        cited = [c for c in cited if not (c["url"] in seen or seen.add(c["url"]))]
+
+        if cited:
+            append_log(
+                "scout",
+                f"Grounded '{cluster_label}' in {len(cited)} real source(s).",
+                "success",
+                details="\n".join(f"• {c['title'] or '(untitled)'}\n  {c['url']}" for c in cited[:10]),
+            )
+
+        candidates = _extract_candidates(full_text, cited)
+
+        # Enrich any candidate missing an image_url by fetching og:image from its source URL.
+        await _enrich_candidate_images(candidates)
+
+        urls_to_open = [c.url for c in candidates if c.url and c.url.startswith("http")][:3]
+        if urls_to_open:
+            asyncio.create_task(_open_urls_in_chrome(urls_to_open, cluster_label))
+
+        append_log("scout", f"Scout returned {len(candidates)} candidate(s) for '{cluster_label}'.", "success")
+        return candidates
     except Exception as e:
-        append_log("scout", f"Scout failed for cluster {dispatch.cluster_id}: {str(e)}", "error")
+        append_log("scout", f"Scout failed for '{cluster_label}': {e}", "error")
         return []
 
 
-# --- AGENT 5: Stage Agent (Playwright Setup & Stub) ---
+# ======================= STAGE (Playwright, sync) =======================
 def run_playwright_stage(url: str) -> StageResponse:
     """
-    Sync Playwright automation stub. Spawns Chrome with persistent user-data-dir
-    and navigates to the item page, allowing the user to inspect it or proceed.
-    Runs inside a thread pool on the backend to prevent locking FastAPI.
+    Sync Playwright stub. Launches Chrome with the user's persistent profile,
+    navigates, screenshots, and leaves the window open for purchase. Called from
+    main.py via run_in_executor to avoid blocking the FastAPI event loop.
     """
-    append_log("stage", f"Initiating Playwright automation for URL: '{url}'", "info")
-    append_log("stage", "Spawning Chromium with persistent context profile: $HOME/chrome-debug-profile2", "info")
-    
-    # We define the Chromium flags and profiles
+    append_log("stage", f"Stage start — url='{url}'", "info")
     user_data_dir = os.path.expandvars("$HOME/chrome-debug-profile2")
-    append_log("stage", f"Resolved profile directory: {user_data_dir}", "info")
-    
-    # If the user wishes to run real Playwright, they can install playwright and run it
-    # We will wrap it in a try-except. If playwright is installed, we actually navigate!
+    append_log("stage", f"Persistent profile: {user_data_dir}", "info")
+
     try:
         from playwright.sync_api import sync_playwright
-        
-        append_log("stage", "Playwright library detected. Launching persistent browser context...", "info")
-        
+
+        append_log("stage", "Launching Chromium persistent context…", "info")
         with sync_playwright() as p:
-            # We launch persistent context. We set headless=False so the user sees the page open!
-            browser_context = p.chromium.launch_persistent_context(
+            ctx = p.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 headless=False,
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
-            
-            # Open a new page or grab the active one
-            page = browser_context.new_page() if not browser_context.pages else browser_context.pages[0]
-            
-            append_log("stage", f"Navigating browser to: '{url}'", "info")
+            page = ctx.new_page() if not ctx.pages else ctx.pages[0]
+
+            append_log("stage", f"Navigating to '{url}'…", "info")
             page.goto(url, timeout=30000)
-            
-            # Let it load
             page.wait_for_timeout(3000)
-            
-            # Take a screenshot
+
             screenshot_dir = os.path.abspath("./screenshots")
             os.makedirs(screenshot_dir, exist_ok=True)
             screenshot_path = os.path.join(screenshot_dir, f"stage_{uuid.uuid4().hex[:8]}.png")
-            
-            append_log("stage", f"Capturing browser snapshot: '{screenshot_path}'", "info")
             page.screenshot(path=screenshot_path)
-            
-            # We LEAVE the browser open so the user can interact. We don't call browser_context.close()
-            # This perfectly addresses the requirement "Navigates, adds to cart, leaves window open"
-            
-            append_log("stage", "Staging successful. Cart tab remains active.", "success")
-            return StageResponse(
-                status="success",
-                screenshot_path=screenshot_path,
-                message=f"Successfully navigated to page. Tab left open in Chrome (profile2)."
-            )
-            
+            append_log("stage", f"Captured screenshot at {screenshot_path}.", "info")
+
+            # Intentionally do NOT close ctx — window stays open for the user.
+            append_log("stage", "Stage success — tab left open in Chrome.", "success")
+            return StageResponse(status="success", screenshot_path=screenshot_path)
+
     except ImportError:
-        append_log("stage", "Playwright is not installed in the current environment. Running mockup staging response.", "warning")
-        append_log("stage", f"SIMULATION: Open '{url}' in persistent Chromium session.", "info")
-        # Simulating loading delay
+        append_log("stage", "Playwright not installed — simulating stage.", "warning")
         import time
-        time.sleep(2.0)
-        append_log("stage", f"SIMULATION: Navulated successfully to '{url}' and cart staged.", "success")
-        return StageResponse(
-            status="success",
-            screenshot_path="/assets/placeholder-screenshot.png",
-            message=f"STUB SUCCESS: Simulated staging of '{url}'. Playwright library was not installed."
-        )
+        time.sleep(1.5)
+        append_log("stage", f"SIMULATION: would have staged '{url}'.", "success")
+        return StageResponse(status="success", screenshot_path="/assets/placeholder-screenshot.png")
     except Exception as e:
-        append_log("stage", f"Playwright execution encountered an error: {str(e)}", "error")
-        return StageResponse(
-            status="failed",
-            message=f"Staging failed: {str(e)}"
-        )
+        append_log("stage", f"Stage failed: {e}", "error")
+        return StageResponse(status="failed", screenshot_path=None)

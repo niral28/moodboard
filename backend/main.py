@@ -4,6 +4,10 @@ import uuid
 import logging
 import asyncio
 from typing import List, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, Request, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
@@ -154,7 +158,7 @@ async def scout(requests: List[ScoutRequest]):
     tasks = []
     for req in requests:
         dispatch = ScoutDispatch(cluster_id=req.cluster_id, priority="high", search_hints=req.search_hints)
-        tasks.append(run_scout_single(dispatch, req.taste_profile, req.cluster_label))
+        tasks.append(run_scout_single(dispatch, req.taste_profile, req.cluster_label, req.user_currency or "USD"))
         
     results = await asyncio.gather(*tasks)
     

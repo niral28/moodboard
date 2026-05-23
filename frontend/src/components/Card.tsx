@@ -1,6 +1,9 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useDraggable } from '@dnd-kit/core';
-import { Trash2, ExternalLink, Image as ImageIcon, Link as LinkIcon, FileText, Mail, GripHorizontal } from 'lucide-react';
+import {
+  Trash2, ChevronDown, ChevronUp, ExternalLink,
+  Image as ImageIcon, Link as LinkIcon, FileText, Mail,
+} from 'lucide-react';
 
 export interface CardType {
   id: string;
@@ -9,13 +12,12 @@ export interface CardType {
   summary: string;
   entities: string[];
   url?: string;
+  cover_image?: string;
   visual_features?: string;
-  // Email-specific fields
   sender?: string;
   subject?: string;
   date?: string;
   body_summary?: string;
-  // Spatial
   x: number;
   y: number;
 }
@@ -25,10 +27,34 @@ interface CardProps {
   onRemove: (id: string) => void;
 }
 
+// Type-specific accent + gradient fallback (for cards without a cover image).
+const TYPE_THEME: Record<CardType['type'], { accent: string; gradient: string; label: string }> = {
+  image: { accent: '#7A8B6E', gradient: 'linear-gradient(135deg, #7A8B6E 0%, #4A5A3E 100%)', label: 'image' },
+  link:  { accent: '#C9974A', gradient: 'linear-gradient(135deg, #C9974A 0%, #8B6824 100%)', label: 'link' },
+  email: { accent: '#A85E40', gradient: 'linear-gradient(135deg, #C77B5C 0%, #6E3F2A 100%)', label: 'email' },
+  text:  { accent: '#6B5C4D', gradient: 'linear-gradient(135deg, #8B7D6A 0%, #3D2F23 100%)', label: 'note' },
+};
+
+function getDomain(url?: string): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+}
+
 export const Card: React.FC<CardProps> = ({ card, onRemove }) => {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
-    id: card.id,
-  });
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: card.id });
+  const [expanded, setExpanded] = useState(false);
+  const [imgFailed, setImgFailed] = useState(false);
+
+  const theme = TYPE_THEME[card.type];
+
+  // Resolve the displayable cover: explicit cover_image, or fall back to url
+  // for image-type cards (legacy demo cards stored the image directly in url).
+  const cover = card.cover_image || (card.type === 'image' ? card.url : null);
+  const showCover = cover && !imgFailed;
 
   const style: React.CSSProperties = {
     position: 'absolute',
@@ -36,159 +62,144 @@ export const Card: React.FC<CardProps> = ({ card, onRemove }) => {
     top: `${card.y}px`,
     transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
     zIndex: isDragging ? 50 : 10,
-    opacity: isDragging ? 0.7 : 1,
-    cursor: 'default',
-    width: '280px',
+    width: '260px',
   };
 
-  // Color theme selectors based on agent/card type
-  const getCardStyleClass = () => {
-    switch (card.type) {
-      case 'email':
-        return 'border-violet-500/20 shadow-[0_0_15px_rgba(139,92,246,0.06)] hover:border-violet-500/40 bg-slate-900/80';
-      case 'image':
-        return 'border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.06)] hover:border-emerald-500/40 bg-slate-900/80';
-      case 'link':
-        return 'border-sky-500/20 shadow-[0_0_15px_rgba(14,165,233,0.06)] hover:border-sky-500/40 bg-slate-900/80';
-      case 'text':
-      default:
-        return 'border-slate-800 shadow-[0_4px_20px_rgba(0,0,0,0.4)] hover:border-slate-700 bg-slate-900/70';
-    }
-  };
+  const TypeIcon = card.type === 'email' ? Mail
+    : card.type === 'image' ? ImageIcon
+    : card.type === 'link' ? LinkIcon
+    : FileText;
 
-  const getCardIcon = () => {
-    switch (card.type) {
-      case 'email':
-        return <Mail className="w-4 h-4 text-violet-400" />;
-      case 'image':
-        return <ImageIcon className="w-4 h-4 text-emerald-400" />;
-      case 'link':
-        return <LinkIcon className="w-4 h-4 text-sky-400" />;
-      case 'text':
-      default:
-        return <FileText className="w-4 h-4 text-slate-400" />;
-    }
-  };
+  const subtitle =
+    card.type === 'email' ? (card.sender || card.date || null)
+    : card.type === 'link' ? getDomain(card.url)
+    : null;
 
   return (
     <div
       ref={setNodeRef}
       style={style}
-      className={`glass-panel rounded-xl overflow-hidden transition-all duration-200 border group select-none ${getCardStyleClass()}`}
+      className={`card-surface sticky-card rounded-xl overflow-hidden group ${isDragging ? 'is-dragging' : ''}`}
+      {...attributes}
+      {...listeners}
     >
-      {/* Card Header & Drag Handle */}
-      <div 
-        {...attributes} 
-        {...listeners} 
-        className="flex items-center justify-between px-3 py-2 bg-slate-950/40 border-b border-white/5 cursor-grab active:cursor-grabbing text-slate-400 group-hover:text-slate-300"
-      >
-        <div className="flex items-center gap-2">
-          {getCardIcon()}
-          <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 select-none">
-            {card.type}
-          </span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <GripHorizontal className="w-3.5 h-3.5 text-slate-600 group-hover:text-slate-400 transition-colors" />
-        </div>
+      {/* Cover (also the drag-handle surface) */}
+      <div className="relative aspect-[4/3] overflow-hidden">
+        {showCover ? (
+          <img
+            src={cover!}
+            alt=""
+            className="w-full h-full object-cover pointer-events-none"
+            onError={() => {
+              console.warn('Card cover failed', { id: card.id, urlStart: (cover || '').slice(0, 60) });
+              setImgFailed(true);
+            }}
+          />
+        ) : (
+          <div
+            className="w-full h-full flex items-center justify-center"
+            style={{ background: theme.gradient }}
+          >
+            <TypeIcon className="w-10 h-10 text-white/90" />
+          </div>
+        )}
+
+        {/* Type chip top-left */}
+        <span
+          className="absolute top-2 left-2 text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded-full bg-white/90 backdrop-blur-sm border"
+          style={{ color: theme.accent, borderColor: theme.accent + '60' }}
+        >
+          {theme.label}
+        </span>
+
+        {/* Delete on hover (top-right) */}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.stopPropagation(); onRemove(card.id); }}
+          className="absolute top-2 right-2 p-1 rounded-full bg-white/90 hover:bg-[#A85E40] hover:text-white text-stone-700 opacity-0 group-hover:opacity-100 transition-all"
+          title="Delete card"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
       </div>
 
-      {/* Card Content */}
-      <div className="p-4 flex flex-col gap-3">
-        {/* Title & Delete button */}
-        <div className="flex justify-between items-start gap-2">
-          <h3 className="font-semibold text-slate-100 text-sm leading-snug tracking-tight">
-            {card.title}
-          </h3>
+      {/* Caption */}
+      <div className="p-3 flex flex-col gap-1.5">
+        <h3 className="font-semibold text-stone-800 text-sm leading-snug line-clamp-2">
+          {card.title}
+        </h3>
+        {subtitle && (
+          <p className="text-[10.5px] text-stone-500 truncate">{subtitle}</p>
+        )}
+
+        <div className="flex items-center justify-between mt-1">
           <button
-            onClick={() => onRemove(card.id)}
-            className="text-slate-600 hover:text-rose-400 p-1 rounded-lg hover:bg-white/5 transition-all opacity-0 group-hover:opacity-100"
-            title="Delete Card"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}
+            className="flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-800 font-medium"
           >
-            <Trash2 className="w-3.5 h-3.5" />
+            {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            <span>{expanded ? 'Hide details' : 'Details'}</span>
           </button>
+          {card.url && card.type === 'link' && (
+            <a
+              href={card.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              className="flex items-center gap-0.5 text-[10px] font-medium hover:underline"
+              style={{ color: theme.accent }}
+            >
+              <span>Open</span>
+              <ExternalLink className="w-2.5 h-2.5" />
+            </a>
+          )}
         </div>
 
-        {/* Email Fields Rendering */}
-        {card.type === 'email' && (
-          <div className="flex flex-col gap-2 p-2 rounded-lg bg-slate-950/30 border border-white/5 text-[11px] text-slate-300 font-mono">
-            {card.sender && (
-              <div className="truncate">
-                <span className="text-slate-500 font-semibold">From: </span>
-                {card.sender}
+        {expanded && (
+          <div className="mt-2 pt-2 border-t border-[#D4C5AC] flex flex-col gap-2">
+            {/* Email-specific fields */}
+            {card.type === 'email' && (
+              <div className="text-[11px] text-stone-700 leading-snug flex flex-col gap-0.5">
+                {card.subject && <div><span className="text-stone-500">Subject: </span>{card.subject}</div>}
+                {card.sender && <div className="truncate"><span className="text-stone-500">From: </span>{card.sender}</div>}
+                {card.date && <div><span className="text-stone-500">Date: </span>{card.date}</div>}
+                {card.body_summary && (
+                  <div className="italic text-stone-600 mt-1">"{card.body_summary}"</div>
+                )}
               </div>
             )}
-            {card.date && (
-              <div>
-                <span className="text-slate-500 font-semibold">Date: </span>
-                {card.date}
+
+            {/* Summary */}
+            {card.summary && (
+              <p className="text-[11.5px] text-stone-700 leading-relaxed">{card.summary}</p>
+            )}
+
+            {/* Visual signature */}
+            {card.visual_features && (
+              <div className="text-[10.5px] p-2 rounded bg-[#7A8B6E]/10 border border-[#7A8B6E]/30 text-[#4A5A3E] leading-relaxed">
+                <span className="font-semibold uppercase tracking-wider text-[8px] block mb-0.5 text-[#5A6A4E]">
+                  Visual signature
+                </span>
+                {card.visual_features}
               </div>
             )}
-            {card.body_summary && (
-              <div className="text-slate-400 italic pt-1 border-t border-white/5 leading-relaxed font-sans">
-                "{card.body_summary}"
+
+            {/* Entities */}
+            {card.entities && card.entities.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {card.entities.slice(0, 8).map((entity, i) => (
+                  <span
+                    key={i}
+                    className="px-1.5 py-0.5 text-[9.5px] rounded bg-[#EDE0C6] border border-[#D4C5AC] text-stone-600 font-medium"
+                  >
+                    {entity}
+                  </span>
+                ))}
               </div>
             )}
           </div>
-        )}
-
-        {/* Image Card rendering */}
-        {card.type === 'image' && card.url && (
-          <div className="relative rounded-lg overflow-hidden border border-white/5 bg-slate-950/20 aspect-video flex items-center justify-center">
-            {card.url.startsWith('http') ? (
-              <img
-                src={card.url}
-                alt={card.title}
-                className="w-full h-full object-cover pointer-events-none"
-              />
-            ) : (
-              <div className="p-4 text-[10px] text-slate-500 text-center font-mono">
-                [Multimodal Uploaded Image]
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Card Summary Description */}
-        {card.summary && card.type !== 'email' && (
-          <p className="text-[12px] text-slate-300 leading-relaxed font-normal">
-            {card.summary}
-          </p>
-        )}
-
-        {/* Visual Features Rendering */}
-        {card.visual_features && (
-          <div className="text-[10px] p-2 rounded-lg bg-slate-950/30 border border-emerald-500/10 text-emerald-300 leading-relaxed font-sans">
-            <span className="font-semibold text-emerald-400 uppercase tracking-wider text-[8px] block mb-0.5">Visual Signature</span>
-            {card.visual_features}
-          </div>
-        )}
-
-        {/* Entities Tag list */}
-        {card.entities && card.entities.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-1">
-            {card.entities.slice(0, 5).map((entity, i) => (
-              <span
-                key={i}
-                className="px-1.5 py-0.5 text-[9px] rounded bg-white/5 border border-white/5 text-slate-400 font-medium"
-              >
-                {entity}
-              </span>
-            ))}
-          </div>
-        )}
-
-        {/* Link anchor */}
-        {card.url && card.type === 'link' && (
-          <a
-            href={card.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1 text-[10px] text-sky-400 hover:text-sky-300 font-medium mt-1 self-start transition-colors"
-          >
-            <span>Visit Reference</span>
-            <ExternalLink className="w-3 h-3" />
-          </a>
         )}
       </div>
     </div>
