@@ -9,7 +9,7 @@ from typing import List, Optional, Dict, Any, Tuple
 
 from pydantic import BaseModel, Field
 
-from browser_bridge import dispatch_browser_action, use_extension_browser
+from browser_bridge import dispatch_browser_action, extension_connected, use_extension_browser
 from browser_cdp import (
     CHROME_FALLBACK_PROFILE,
     SCOUT_CDP_ENDPOINT,
