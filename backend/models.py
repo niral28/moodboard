@@ -98,3 +98,14 @@ class StageRequest(BaseModel):
 class StageResponse(BaseModel):
     status: str = Field(description="'success' | 'failed'")
     screenshot_path: Optional[str] = Field(None, description="Path to screenshot of the staged cart page")
+
+
+# --- Extension browser bridge ---
+class BrowserResultRequest(BaseModel):
+    action_id: str
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class ExtensionHelloRequest(BaseModel):
+    version: Optional[str] = None

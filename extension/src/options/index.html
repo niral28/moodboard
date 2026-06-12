@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Moodboard Options</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; color: #3d2f23; }
+      label { display: block; font-weight: 600; margin-bottom: 0.25rem; }
+      input { width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #d4c5ac; border-radius: 6px; }
+      button { background: #c77b5c; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; }
+      #status { margin-top: 1rem; font-size: 0.875rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Moodboard</h1>
+    <p>Local backend + Ollama settings</p>
+    <label for="apiBase">Backend URL</label>
+    <input id="apiBase" type="url" placeholder="http://localhost:8000" />
+    <button id="save">Save &amp; test</button>
+    <pre id="status"></pre>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

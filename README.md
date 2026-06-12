@@ -159,18 +159,36 @@ The whole flow — drop card → cluster → dispatch → reason → browse → 
 
 ## Run it
 
+### Chrome extension (recommended — local Ollama)
+
+```bash
+# 1. Ollama
+ollama pull qwen3.5:9b
+ollama serve
+
+# 2. Backend (extension browser mode)
+./scripts/start-moodboard.sh
+
+# 3. Extension
+cd extension && npm install && npm run build
+# chrome://extensions → Load unpacked → extension/dist
+# Open a new tab → moodboard canvas
+```
+
+See [extension/README.md](extension/README.md) for options, context-menu ingest, and scout tab groups.
+
+### Web app (legacy dev UI)
+
 ```bash
 # Backend
 cd backend
 echo "GEMINI_API_KEY=..." > .env
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/playwright install chromium   # one-time, ~150 MB
+BROWSER_BACKEND=playwright .venv/bin/playwright install chromium   # only for playwright fallback
 .venv/bin/python -m uvicorn main:app --reload --port 8000
 
-# Chrome (for live tab orchestration — optional but high demo impact)
-'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/chrome-debug-profile2"
+# Chrome CDP (only if BROWSER_BACKEND=playwright)
+./scripts/launch-chrome-debug.sh
 
 # Frontend
 cd frontend

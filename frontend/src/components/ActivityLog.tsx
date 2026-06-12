@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Terminal, Trash2, ChevronRight } from 'lucide-react';
+import { Terminal, Trash2, ChevronRight, Brain } from 'lucide-react';
 
 export interface LogEntry {
   agent: 'ingest' | 'curate' | 'orchestrate' | 'scout' | 'stage';
@@ -9,6 +9,7 @@ export interface LogEntry {
   details?: string;
   cluster_id?: string;
   phase?: 'start' | 'end';
+  kind?: 'reasoning' | string;
 }
 
 interface ActivityLogProps {
@@ -28,8 +29,21 @@ export const ActivityLog: React.FC<ActivityLogProps> = ({ logs, onClearLogs }) =
     });
   };
 
-  // Auto scroll to bottom of logs
+  const isReasoning = (log: LogEntry) =>
+    log.kind === 'reasoning' || log.message.includes('thinking:');
+
+  // Auto-expand reasoning traces; keep scroll pinned to bottom.
   useEffect(() => {
+    const reasoningIdx = logs
+      .map((log, i) => (isReasoning(log) && log.details ? i : -1))
+      .filter((i) => i >= 0);
+    if (reasoningIdx.length > 0) {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        reasoningIdx.forEach((i) => next.add(i));
+        return next;
+      });
+    }
     if (containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
@@ -117,39 +131,60 @@ export const ActivityLog: React.FC<ActivityLogProps> = ({ logs, onClearLogs }) =
         ) : (
           logs.map((log, i) => {
             const hasDetails = !!log.details;
+            const reasoning = isReasoning(log);
             const isOpen = expanded.has(i);
             return (
               <div
                 key={i}
-                className="flex flex-col animate-fade-in py-0.5"
+                className={`flex flex-col animate-fade-in py-0.5 ${reasoning ? 'rounded-md' : ''}`}
               >
                 <div
-                  className={`flex gap-2 items-start ${hasDetails ? 'cursor-pointer hover:bg-[#EDE0C6]/60 rounded' : ''}`}
+                  className={`flex gap-2 items-start ${
+                    hasDetails
+                      ? `cursor-pointer rounded ${reasoning ? 'hover:bg-[#E8E0F4]/50' : 'hover:bg-[#EDE0C6]/60'}`
+                      : ''
+                  }`}
                   onClick={hasDetails ? () => toggle(i) : undefined}
                 >
                   <span className="shrink-0 w-3 text-stone-500 select-none">
                     {hasDetails ? (
-                      <ChevronRight
-                        className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-90' : ''}`}
-                      />
+                      reasoning ? (
+                        <Brain className="w-3 h-3 text-[#6B5B95]" />
+                      ) : (
+                        <ChevronRight
+                          className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-90' : ''}`}
+                        />
+                      )
                     ) : null}
                   </span>
                   <span className="text-stone-500 shrink-0 select-none">
                     [{log.timestamp}]
                   </span>
                   <span
-                    className={`text-[8.5px] font-bold uppercase px-1.5 py-0.5 rounded border tracking-wider shrink-0 select-none font-sans ${getAgentStyle(
-                      log.agent
-                    )}`}
+                    className={`text-[8.5px] font-bold uppercase px-1.5 py-0.5 rounded border tracking-wider shrink-0 select-none font-sans ${
+                      reasoning
+                        ? 'bg-[#E8E0F4]/60 text-[#5C4D7A] border-[#B8A8D8]/50'
+                        : getAgentStyle(log.agent)
+                    }`}
                   >
-                    {getAgentLabel(log.agent)}
+                    {reasoning ? 'Reasoning' : getAgentLabel(log.agent)}
                   </span>
-                  <span className={`flex-1 break-words ${getLevelStyle(log.level)}`}>
+                  <span
+                    className={`flex-1 break-words ${
+                      reasoning ? 'text-[#5C4D7A] italic' : getLevelStyle(log.level)
+                    }`}
+                  >
                     {log.message}
                   </span>
                 </div>
                 {hasDetails && isOpen && (
-                  <pre className="ml-7 mt-1 mb-2 p-2 rounded bg-[#EDE0C6] border border-[#D4C5AC] text-[10px] text-stone-700 whitespace-pre-wrap break-words leading-relaxed select-text">
+                  <pre
+                    className={`ml-7 mt-1 mb-2 p-2 rounded border text-[10px] whitespace-pre-wrap break-words leading-relaxed select-text ${
+                      reasoning
+                        ? 'bg-[#F3EFF9] border-[#C9B8E8]/60 text-[#4A3F63]'
+                        : 'bg-[#EDE0C6] border-[#D4C5AC] text-stone-700'
+                    }`}
+                  >
                     {log.details}
                   </pre>
                 )}

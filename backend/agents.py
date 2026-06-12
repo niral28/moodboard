@@ -7,10 +7,17 @@ import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
 
+from browser_bridge import dispatch_browser_action, use_extension_browser
+from browser_cdp import (
+    CHROME_FALLBACK_PROFILE,
+    SCOUT_CDP_ENDPOINT,
+    cdp_launch_hint,
+    probe_cdp,
+)
+from llm_provider import ContentPart, SCOUT_TOOLS, get_llm_provider
+from web_fetch import fetch_markdown, fetch_markdown_previews, looks_like_url
 from models import (
     Card, Cluster, CurateResponse,
     ScoutDispatch, OrchestrateResponse,
@@ -20,21 +27,40 @@ from models import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("moodboard.agents")
 
-# --- SDK client ---
-_api_key = os.environ.get("GEMINI_API_KEY")
-client: Optional[genai.Client] = genai.Client(api_key=_api_key) if _api_key else None
-if client is None:
-    logger.warning("GEMINI_API_KEY not set — agents will return mock data.")
-
-MODEL = "gemini-3.5-flash"
-THINKING = types.ThinkingConfig(thinking_budget=-1)  # dynamic; the model decides depth
+llm = get_llm_provider()
+logger.info(f"LLM config: {llm.label}")
+if not llm.available:
+    logger.warning(f"Main LLM unavailable ({llm.provider_name}) — agents will return mock data.")
+if llm.split_vision and not llm.vision_available:
+    logger.warning("Vision LLM unavailable — image tasks will fall back to the main provider.")
 
 # --- Activity log / SSE plumbing ---
-# event_queue carries both log entries and streamed payloads (e.g. candidates as
-# they become viable). Items with kind="candidate" are routed differently by
-# the frontend; everything else is treated as a log entry.
+# Each SSE client gets its own queue; events are broadcast to all subscribers so
+# browser_action commands reach the extension background even when the new-tab
+# page is also connected.
 event_logs: List[Dict[str, Any]] = []
-event_queue: asyncio.Queue = asyncio.Queue()
+_sse_subscribers: List[asyncio.Queue] = []
+
+
+def subscribe_sse() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    _sse_subscribers.append(q)
+    return q
+
+
+def unsubscribe_sse(q: asyncio.Queue) -> None:
+    try:
+        _sse_subscribers.remove(q)
+    except ValueError:
+        pass
+
+
+def _broadcast_sse(payload: Dict[str, Any]) -> None:
+    for q in list(_sse_subscribers):
+        try:
+            q.put_nowait(payload)
+        except Exception:
+            pass
 
 
 def push_event(payload: Dict[str, Any]) -> None:
@@ -43,15 +69,15 @@ def push_event(payload: Dict[str, Any]) -> None:
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            loop.call_soon_threadsafe(event_queue.put_nowait, payload)
+            loop.call_soon_threadsafe(_broadcast_sse, payload)
             return
     except RuntimeError:
         pass
-    event_queue.put_nowait(payload)
+    _broadcast_sse(payload)
 
 
-# Image bytes destined for Gemini multimodal calls are aggressively downsized:
-# Gemini's visual reasoning works well at small dimensions, and the token cost
+# Image bytes for multimodal LLM calls are aggressively downsized: visual
+# reasoning works well at small dimensions, and token cost scales with image area.
 # scales with image area. 384px max-dim + JPEG q70 keeps each image at ~10-30KB.
 def _resize_image_bytes(img_bytes: bytes, max_dim: int = 384, quality: int = 70) -> bytes:
     try:
@@ -178,11 +204,14 @@ def append_log(
     details: Optional[str] = None,
     cluster_id: Optional[str] = None,
     phase: Optional[str] = None,  # "start" | "end" — drives per-cluster activity highlighting in the UI
+    kind: Optional[str] = None,  # e.g. "reasoning" — drives expanded trace UI in the frontend
 ):
     timestamp = datetime.now().strftime("%H:%M:%S")
     entry: Dict[str, Any] = {"agent": agent, "message": message, "level": level, "timestamp": timestamp}
     if details:
         entry["details"] = details
+    if kind:
+        entry["kind"] = kind
     if cluster_id:
         entry["cluster_id"] = cluster_id
     if phase:
@@ -191,9 +220,9 @@ def append_log(
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            loop.call_soon_threadsafe(event_queue.put_nowait, entry)
+            loop.call_soon_threadsafe(_broadcast_sse, entry)
     except RuntimeError:
-        event_queue.put_nowait(entry)
+        _broadcast_sse(entry)
     except Exception as e:
         logger.error(f"queue error: {e}")
     logger.info(f"[{agent.upper()}] {message}")
@@ -202,20 +231,9 @@ def append_log(
 async def _generate_structured(
     prompt: str,
     schema: type[BaseModel],
-    parts: Optional[List[Any]] = None,
+    parts: Optional[List[ContentPart]] = None,
 ) -> Dict[str, Any]:
-    contents: List[Any] = list(parts) if parts else []
-    contents.append(prompt)
-    response = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=schema,
-            thinking_config=THINKING,
-        ),
-    )
-    return json.loads(response.text)
+    return await llm.generate_structured(prompt, schema, parts=parts)
 
 
 # ======================= INGEST =======================
@@ -246,8 +264,8 @@ async def run_ingest(
 ) -> Card:
     append_log("ingest", f"Ingest start — hint={hint or 'none'}, image={'yes' if image_bytes else 'no'}.", "info")
 
-    if client is None:
-        append_log("ingest", "No API key — returning mock card.", "warning")
+    if not llm.available:
+        append_log("ingest", f"LLM unavailable ({llm.provider_name}) — returning mock card.", "warning")
         await asyncio.sleep(0.5)
         return Card(
             id=str(uuid.uuid4()),
@@ -258,19 +276,28 @@ async def run_ingest(
             x=120.0, y=120.0,
         )
 
-    parts: List[Any] = []
+    parts: List[ContentPart] = []
     if image_bytes:
         original_size = len(image_bytes)
         resized = _resize_image_bytes(image_bytes)
         if resized is not image_bytes:
-            append_log("ingest", f"Resized image for Gemini: {original_size//1024}KB → {len(resized)//1024}KB.", "info")
-        parts.append(types.Part.from_bytes(data=resized, mime_type="image/jpeg"))
+            append_log("ingest", f"Resized image for LLM: {original_size//1024}KB → {len(resized)//1024}KB.", "info")
+        parts.append((resized, mime_type or "image/jpeg"))
 
     user_block = f"User input:\n{content}\n\nHint: {hint or 'none'}"
+
+    # For dropped URLs, fetch markdown so ingest can summarize real page content.
+    ingest_url = content.strip() if looks_like_url(content) else None
+    if ingest_url:
+        md = await fetch_markdown(ingest_url)
+        if md:
+            user_block += f"\n\nFetched page content (markdown):\n{md}"
+            append_log("ingest", f"Fetched markdown ({len(md)} chars) for link ingest.", "info")
+
     prompt = f"{INGEST_PROMPT}\n\n{user_block}"
 
     try:
-        append_log("ingest", "Calling Gemini 3.5 Flash (thinking enabled)…", "info")
+        append_log("ingest", f"Calling {llm.structured_provider(parts).label}…", "info")
         data = await _generate_structured(prompt, Card, parts=parts)
         data["id"] = str(uuid.uuid4())
         card = Card(**data)
@@ -310,12 +337,12 @@ Identify `gaps` as 3–5 concrete additions whose absence is conspicuous given t
 """
 
 
-def _extract_image_parts(cards: List[Card]) -> Tuple[List[Any], List[Card]]:
-    """Pull data:image/* covers off image cards, downsize them for Gemini, and
-    return the multimodal Parts + a sanitized card list (with the bulky data
+def _extract_image_parts(cards: List[Card]) -> Tuple[List[ContentPart], List[Card]]:
+    """Pull data:image/* covers off image cards, downsize them for the LLM, and
+    return multimodal content parts + a sanitized card list (with the bulky data
     URL replaced by a reference). Caps the number of attached images to
     MAX_CURATE_IMAGES — overflow falls back to text-only for those cards."""
-    parts: List[Any] = []
+    parts: List[ContentPart] = []
     sanitized: List[Card] = []
     images_attached = 0
 
@@ -327,7 +354,7 @@ def _extract_image_parts(cards: List[Card]) -> Tuple[List[Any], List[Card]]:
                 _, b64 = cover.split(",", 1)
                 raw = base64.b64decode(b64)
                 resized = _resize_image_bytes(raw)
-                parts.append(types.Part.from_bytes(data=resized, mime_type="image/jpeg"))
+                parts.append((resized, "image/jpeg"))
                 parts.append(f"^^^ Image above is card id={c.id}, title='{c.title}'")
                 clone = c.model_copy(update={
                     "cover_image": f"(image attached as card {c.id})",
@@ -354,8 +381,8 @@ async def run_curate(cards: List[Card]) -> CurateResponse:
         append_log("curate", "Empty canvas — nothing to curate.", "warning")
         return CurateResponse(clusters=[], taste_profile="Empty canvas.", gaps=[])
 
-    if client is None:
-        append_log("curate", "No API key — returning mock curation.", "warning")
+    if not llm.available:
+        append_log("curate", f"LLM unavailable ({llm.provider_name}) — returning mock curation.", "warning")
         await asyncio.sleep(0.5)
         return CurateResponse(
             clusters=[Cluster(id="mock_cl", label="Unsorted", card_ids=[c.id for c in cards])],
@@ -377,7 +404,7 @@ async def run_curate(cards: List[Card]) -> CurateResponse:
     )
 
     try:
-        append_log("curate", "Calling Gemini 3.5 Flash for clustering + taste synthesis…", "info")
+        append_log("curate", f"Calling {llm.structured_provider(image_parts or None).label} for clustering + taste synthesis…", "info")
         data = await _generate_structured(prompt, CurateResponse, parts=image_parts or None)
         res = CurateResponse(**data)
         append_log("curate", f"Curated into {len(res.clusters)} clusters, {len(res.gaps)} gaps.", "success")
@@ -413,8 +440,8 @@ async def run_orchestrate(clusters: List[Cluster], taste_profile: str, gaps: Lis
         append_log("orchestrate", "No clusters — no dispatches.", "warning")
         return OrchestrateResponse(scout_dispatches=[])
 
-    if client is None:
-        append_log("orchestrate", "No API key — returning mock dispatches.", "warning")
+    if not llm.available:
+        append_log("orchestrate", f"LLM unavailable ({llm.provider_name}) — returning mock dispatches.", "warning")
         await asyncio.sleep(0.5)
         return OrchestrateResponse(scout_dispatches=[
             ScoutDispatch(cluster_id=c.id, priority="medium", search_hints=[f"explore {c.label}"])
@@ -429,7 +456,7 @@ async def run_orchestrate(clusters: List[Cluster], taste_profile: str, gaps: Lis
     prompt = f"{ORCHESTRATE_PROMPT}\n\nCuration state:\n{json.dumps(payload, indent=2)}"
 
     try:
-        append_log("orchestrate", "Calling Gemini 3.5 Flash for dispatch planning…", "info")
+        append_log("orchestrate", f"Calling {llm.label} for dispatch planning…", "info")
         data = await _generate_structured(prompt, OrchestrateResponse)
         res = OrchestrateResponse(**data)
         append_log("orchestrate", f"Planned {len(res.scout_dispatches)} scout dispatches.", "success")
@@ -457,11 +484,6 @@ async def run_orchestrate(clusters: List[Cluster], taste_profile: str, gaps: Lis
 # All steps stream to the SSE activity log so the demo can watch the agent think.
 
 MAX_SCOUT_STEPS = 20
-CHROME_PROFILE_PATH = os.environ.get(
-    "CHROME_PROFILE_PATH",
-    os.path.expandvars("$HOME/chrome-debug-profile2"),
-)
-SCOUT_CDP_ENDPOINT = os.environ.get("CHROME_CDP_URL", "http://localhost:9222")
 
 
 # --- Journal (process-wide, in-memory) -----------------------------------------
@@ -500,6 +522,9 @@ _browser_lock = asyncio.Lock()
 
 
 async def _get_browser_context() -> Optional[Any]:
+    """Playwright browser context — only used when BROWSER_BACKEND=playwright."""
+    if use_extension_browser():
+        return None
     global _pw_instance, _browser, _browser_context
     async with _browser_lock:
         if _browser_context is not None:
@@ -519,157 +544,55 @@ async def _get_browser_context() -> Optional[Any]:
         if _pw_instance is None:
             _pw_instance = await async_playwright().start()
 
-        # Preferred: attach to user's existing Chrome (visible to the demo audience).
-        try:
-            _browser = await _pw_instance.chromium.connect_over_cdp(SCOUT_CDP_ENDPOINT)
-            _browser_context = _browser.contexts[0] if _browser.contexts else await _browser.new_context()
-            append_log("scout", f"Attached to Chrome via CDP at {SCOUT_CDP_ENDPOINT}.", "info")
-            return _browser_context
-        except Exception as e:
-            logger.warning(f"CDP attach failed ({e}); falling back to dedicated headed Chromium.")
+        cdp_status = probe_cdp(SCOUT_CDP_ENDPOINT)
 
-        # Fallback: launch persistent context against the dedicated profile dir.
+        # Preferred: attach to the user's existing Chrome (visible to the demo audience).
+        if cdp_status["reachable"]:
+            try:
+                _browser = await _pw_instance.chromium.connect_over_cdp(SCOUT_CDP_ENDPOINT)
+                _browser_context = _browser.contexts[0] if _browser.contexts else await _browser.new_context()
+                browser_label = cdp_status.get("browser") or "Chrome"
+                append_log("scout", f"Attached to {browser_label} via CDP at {SCOUT_CDP_ENDPOINT}.", "info")
+                return _browser_context
+            except Exception as e:
+                msg = f"CDP is up at {SCOUT_CDP_ENDPOINT} but Playwright attach failed: {e}"
+                logger.warning(msg)
+                append_log("scout", msg, "error")
+                append_log("scout", "Quit Chrome completely, relaunch with ./scripts/launch-chrome-debug.sh", "warning")
+                return None
+
+        # CDP not running — launch Playwright's bundled Chromium on a separate profile
+        # so we never contend with a CDP Chrome instance for the same user-data-dir.
         try:
-            os.makedirs(CHROME_PROFILE_PATH, exist_ok=True)
+            os.makedirs(CHROME_FALLBACK_PROFILE, exist_ok=True)
+            append_log(
+                "scout",
+                f"CDP not reachable at {SCOUT_CDP_ENDPOINT} — launching Playwright Chromium.",
+                "warning",
+            )
+            append_log("scout", cdp_launch_hint(), "info")
             _browser_context = await _pw_instance.chromium.launch_persistent_context(
-                user_data_dir=CHROME_PROFILE_PATH,
+                user_data_dir=CHROME_FALLBACK_PROFILE,
                 headless=False,
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
             _browser = None  # persistent_context doesn't expose a separate Browser
-            append_log("scout", f"Launched headed Chromium with profile at {CHROME_PROFILE_PATH}.", "info")
+            append_log("scout", f"Headed Chromium ready (fallback profile: {CHROME_FALLBACK_PROFILE}).", "info")
             return _browser_context
         except Exception as e:
             append_log("scout", f"Could not start browser: {e}", "error")
+            append_log("scout", cdp_launch_hint(), "info")
             return None
 
 
-# --- Tool declarations for Gemini function calling -----------------------------
-SCOUT_TOOLS = types.Tool(function_declarations=[
-    types.FunctionDeclaration(
-        name="search_web",
-        description=(
-            "Search the web for a query. Returns top results [{title, snippet, url}]. "
-            "Use to discover candidate sources before opening tabs. "
-            "Queries should be specific and qualifier-rich (include materials, brands, "
-            "price tiers, locations from the cluster or feedback)."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={"query": types.Schema(type="STRING")},
-            required=["query"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="open_link",
-        description=(
-            "Open a link from your search results in a real Chrome tab. Use this to "
-            "verify a candidate by reading the actual page rather than relying on a "
-            "search snippet. Returns the page title and the first ~3000 chars of "
-            "visible text. The opened tab becomes the active tab for follow-up "
-            "scroll_and_capture and extract_products calls."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={"url": types.Schema(type="STRING")},
-            required=["url"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="click",
-        description=(
-            "Click an element on the active tab by its visible text. Use to dismiss "
-            "popups ('Accept', 'No thanks', 'Close'), follow on-site links, or activate "
-            "filters. open_link already attempts to auto-dismiss common popups — only "
-            "call click if the page still has overlays in the way, or you need to "
-            "navigate within the site."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "text": types.Schema(type="STRING", description="Visible text of the target — exact or substring."),
-            },
-            required=["text"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="scroll_and_capture",
-        description=(
-            "Scroll the active tab in a direction and return newly visible text. "
-            "Use after open_tab when relevant content is below the fold."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "direction": types.Schema(type="STRING", enum=["down", "up"]),
-                "amount_px": types.Schema(type="INTEGER"),
-            },
-            required=["direction", "amount_px"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="extract_products",
-        description=(
-            "Run a structured-extraction pass on the active tab. Returns a list of "
-            "products [{title, price, image_url, product_url}]. Use when the active "
-            "tab lists multiple items and you want a clean comparable set."
-        ),
-        parameters=types.Schema(type="OBJECT", properties={}),
-    ),
-    types.FunctionDeclaration(
-        name="note",
-        description=(
-            "Record a durable observation to the shared Journal — visible to other "
-            "scouts and to future Ticks. Use for insights worth remembering beyond "
-            "this scout's loop."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={"content": types.Schema(type="STRING")},
-            required=["content"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="add_candidate",
-        description=(
-            "Commit one verified candidate to the user's sidebar IMMEDIATELY. "
-            "The user watches candidates appear in real time as you call this, "
-            "so do not batch them — call add_candidate the moment you've verified "
-            "a lead via open_link/extract_products, then keep researching the next. "
-            "Aim for 3-5 calls total over the course of your loop. "
-            "Provide title, url (a real destination, not a search redirector), "
-            "match_reason; include price in the user's currency and image_url "
-            "when known from the page you visited."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "title": types.Schema(type="STRING"),
-                "url": types.Schema(type="STRING"),
-                "price": types.Schema(type="STRING"),
-                "image_url": types.Schema(type="STRING"),
-                "emoji": types.Schema(type="STRING", description="A single emoji representing this candidate visually (e.g. '🪵' for a wooden bench, '🍵' for a tea ceremony). Used as a fallback when image_url is missing."),
-                "match_reason": types.Schema(type="STRING"),
-            },
-            required=["title", "url", "match_reason"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="done",
-        description=(
-            "Terminate this scout. Call after you've added 3-5 candidates via "
-            "add_candidate and have nothing more worth committing. Takes no arguments."
-        ),
-        parameters=types.Schema(type="OBJECT", properties={}),
-    ),
-])
+# --- Tool declarations for scout function calling (OpenAI format; see llm_provider.SCOUT_TOOLS) ---
 
 
 SCOUT_SYSTEM = """\
 You are a research scout for Moodboard. You receive one cluster of cards the user has saved, plus the user's overall taste profile and any feedback they've left on past suggestions. Your job: find 3-5 items the user would want to add to that cluster.
 
 You have these tools:
-- search_web(query): grounded web search — returns titles, URLs, snippets
+- search_web(query): grounded web search — returns titles, URLs, snippets, and optional markdown_preview for editorial pages (use previews to rank which URL to open_link first; still open_link before add_candidate)
 - open_link(url): opens one of those URLs as a real Chrome tab; returns the live page text. Auto-dismisses common cookie/newsletter popups.
 - click(text): clicks an element on the active tab by its visible text. Use for residual popups ("Accept", "No thanks", "Close"), pagination, or on-site filters.
 - scroll_and_capture(direction, amount_px): scrolls the active tab
@@ -678,23 +601,31 @@ You have these tools:
 - add_candidate(title, url, price, image_url, match_reason): COMMIT ONE candidate to the user's sidebar right now. Call this as soon as you've verified each pick — the user sees them appear live.
 - done(): terminate this scout when you've committed 3-5 candidates and have nothing more worth adding.
 
-How to work (commit candidates incrementally, do NOT batch them):
-1. Run search_web once with a specific, qualifier-rich query.
-2. Read the returned links. Pick the 1-3 most promising URLs based on title and domain. If the results suggest a better angle, run one more refined search_web — don't loop searching aimlessly.
-3. Call open_link on a promising lead to visit the page. Search snippets are too thin to commit — you must read the actual page.
-4. If the page text reads like a cookie banner, signup wall, or modal copy ("By continuing you agree to...", "Subscribe for 10% off", "We use cookies") rather than actual content, the auto-dismissal missed something — call click("Accept all") / click("No thanks") / click("Close") / click("×") to clear it, then read again.
-5. Use scroll_and_capture or extract_products to gather concrete details (price, materials, availability).
-6. As soon as that single page produces a verified candidate, call add_candidate with it. The card appears in the sidebar immediately. Do NOT wait until you have all of them.
-7. Move on to the next lead: open_link, verify, add_candidate. Repeat until you have 3-5 commits.
-8. Call done() to terminate.
+How to work (this order is not a suggestion, it's the workflow):
+1. Run search_web ONCE with a specific, qualifier-rich query.
+2. Look at the returned links (and any markdown_preview text). Default action: open_link on the most promising one (best-matching title + credible domain + strongest preview). Do NOT refine your search unless the results are obviously off-topic for the cluster — your search query was good, the snippets are just too thin to commit from.
+3. Read the perception insight that came back with the open_link result — it tells you exactly what's missing and what to do next via `next_action_hint`. Follow it:
+   - `click_close` → there's still a popup blocking content. Call click("Accept all") / click("No thanks") / click("Close") / click("×") and re-read.
+   - `scroll` → relevant content is below the fold. Call scroll_and_capture(direction="down", amount_px=900).
+   - `add_candidate` → you have enough; commit it.
+   - `open_different` → this page is a dead end; open another result from the same search.
+   - `done` → you've gathered enough overall; finish.
+4. On retailer/listing pages with multiple items, call extract_products to get a clean structured list before you decide which one to commit — it surfaces items hidden by the first-paint text.
+5. Only commit (add_candidate) once the page has actually shown you price / availability / a real image / enough detail to defend the pick. A single open_link with no follow-up interaction is usually not enough evidence — if the insight didn't say `add_candidate`, you need more interaction first.
+6. As soon as a page produces a verified candidate, call add_candidate — do NOT wait until you have all of them. The user watches them appear live.
+7. Pick the NEXT result from the same search and repeat step 2-6. You typically have 7-8 results from one search_web — work through them, don't re-search from scratch.
+8. Call done() once you have 3-5 commits.
 
 Hard rules:
-- You MUST call open_link at least once before any add_candidate. Snippets are reconnaissance, not evidence. The audience expects to see tabs opening.
+- DEFAULT TO OPENING, NOT SEARCHING. After any search_web, your next action must be open_link unless every single returned result is obviously unrelated to the cluster theme. Re-searching with a slightly different query is the most common failure mode — resist it.
+- AFTER OPENING, INTERACT. Don't just open_link and immediately move on or commit blindly — the page rendering gives you 3000 chars but the relevant detail may need a scroll or an extract_products. The perception insight's `next_action_hint` is your guide: follow it. Treating open_link as "look once, decide" instead of "begin interaction" is the second most common failure mode.
+- You MUST call open_link at least once before any add_candidate. Snippets are reconnaissance, not evidence. The audience expects to see tabs opening AND interacting.
+- Never call search_web twice in a row without an open_link in between. If you find yourself wanting to, you are loop-stuck — instead, open the best of the existing results and judge from the real page.
 - Each add_candidate must use a real destination URL — never a `vertexaisearch.cloud.google.com` redirector. open_link resolves those for you.
 - If the user has left feedback, treat it as a HARD CONSTRAINT. Surface that you're applying it in your reasoning.
 - Prices must be in the user's preferred currency.
 
-Be efficient — aim for 4-8 tool calls total, max 10. Stop searching once your leads are concrete; commit candidates as you verify them; call done() when you have enough.
+Be efficient — aim for 4-8 tool calls total, max 10. Commit as you verify; call done() the moment you have enough.
 """
 
 
@@ -715,7 +646,8 @@ class ScoutContext:
         self.cluster_cards = cluster_cards
         self.taste_profile = taste_profile
         self.user_currency = user_currency
-        self.page: Any = None  # lazy: assigned on first browser-tool call
+        self.page: Any = None  # lazy: assigned on first browser-tool call (playwright mode)
+        self.extension_tab_id: Optional[int] = None  # active scout tab (extension mode)
         self.observations: List[Dict[str, Any]] = []
         self.last_extracted_products: List[Dict[str, Any]] = []  # available context for add_candidate
         self.committed_candidates: List[Candidate] = []  # streamed to sidebar as add_candidate is called
@@ -752,10 +684,15 @@ def _build_step_prompt(ctx: ScoutContext) -> str:
             if insight.get("candidate_url"):
                 cand_bits.append(f"url={insight['candidate_url']}")
             cand_str = (" | " + ", ".join(cand_bits)) if cand_bits else ""
+            hint = insight.get("next_action_hint", "?")
+            target = insight.get("click_target")
+            hint_line = f"  → next_action_hint: {hint}"
+            if hint in ("click_close", "click") and target:
+                hint_line += f' (click_target="{target}" — call click(text="{target}"))'
             obs_lines.append(
                 f"Step {i}: {o['action']}({args_str})\n"
                 f"  → [{lead}{cand_str}] {insight.get('summary','')}\n"
-                f"  → next_action_hint: {insight.get('next_action_hint','?')}"
+                f"{hint_line}"
             )
         else:
             result_str = _summarize_for_log(result, limit=320)
@@ -768,11 +705,24 @@ def _build_step_prompt(ctx: ScoutContext) -> str:
     search_count = sum(1 for o in ctx.observations if o["action"] == "search_web")
     research_only = open_count + search_count
 
-    # Anti-loop nudge: if the scout has done a lot of search+open without
-    # committing anything, force it to either commit a lead from its
-    # observations or terminate.
+    # Diagnostics for tightened nudges below
+    last_two_actions = [o["action"] for o in ctx.observations[-2:]]
+    consecutive_searches = len(last_two_actions) == 2 and all(a == "search_web" for a in last_two_actions)
+    search_without_open = search_count >= 2 and open_count == 0
+
     nudge_block = ""
-    if committed == 0 and research_only >= 4:
+    if consecutive_searches or search_without_open:
+        # Most common failure mode — the model keeps refining queries instead of
+        # opening any returned link. Hard stop.
+        nudge_block = (
+            f"\n[STOP SEARCHING]\n"
+            f"You have called search_web {search_count} time(s) but open_link {open_count} time(s). "
+            f"Your queries are fine — what's missing is evidence. Pick the most promising URL from your "
+            f"most recent search_web result and call open_link on it RIGHT NOW. Do not search again. "
+            f"Snippets cannot ever produce a verified candidate; only opened pages can.\n"
+        )
+    elif committed == 0 and research_only >= 4:
+        # Broader fallback: lots of research, zero commits.
         nudge_block = (
             f"\n[ANTI-LOOP NUDGE]\n"
             f"You have called search_web {search_count} time(s) and open_link {open_count} time(s) "
@@ -850,52 +800,37 @@ async def _resolve_vertex_urls_parallel(urls: List[str]) -> List[str]:
 
 
 # --- Tool implementations -----------------------------------------------------
-async def _tool_search_web(query: str) -> Dict[str, Any]:
-    """Internal grounded search via Gemini Flash. Returns up to 8 results.
-    Vertex grounding-redirector URLs are resolved to their real destinations
-    so the scout never tries to open invalid links."""
-    if client is None:
-        return {"error": "no API key"}
-    try:
-        resp = await client.aio.models.generate_content(
-            model=MODEL,
-            contents=(
-                f"Web search request: {query}\n\n"
-                "Use your search tool and return the top 5-8 results as bullet points: "
-                "'TITLE — URL — one-line snippet'. No commentary."
-            ),
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
-        )
-        raw_results: List[Dict[str, str]] = []
-        # Prefer grounding metadata (real URLs) when available
-        for cand in (resp.candidates or []):
-            gm = getattr(cand, "grounding_metadata", None)
-            if gm and getattr(gm, "grounding_chunks", None):
-                for gc in gm.grounding_chunks:
-                    web = getattr(gc, "web", None)
-                    if web and getattr(web, "uri", None):
-                        raw_results.append({
-                            "title": getattr(web, "title", "") or "",
-                            "url": web.uri,
-                            "snippet": "",
-                        })
-        # If no grounding metadata, parse text bullets best-effort
-        if not raw_results:
-            text = (resp.text or "").strip()
-            for line in text.splitlines():
-                line = line.strip().lstrip("•-*").strip()
-                if " — " in line and "http" in line:
-                    parts = [p.strip() for p in line.split(" — ", 2)]
-                    if len(parts) >= 2:
-                        raw_results.append({
-                            "title": parts[0],
-                            "url": parts[1],
-                            "snippet": parts[2] if len(parts) > 2 else "",
-                        })
+async def _chrome_google_search(query: str) -> Optional[List[Dict[str, str]]]:
+    """Run a Google search in the user's Chrome via the extension (no Gemini credits)."""
+    if not use_extension_browser() or not extension_connected():
+        return None
+    result = await dispatch_browser_action(
+        "search", "google_search", {"query": query}, timeout=45.0,
+    )
+    if result.get("error"):
+        append_log("scout", f"Chrome search failed: {result['error']}", "warning")
+        return None
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return None
+    return rows
 
-        # Resolve any Vertex redirector URLs to their real destinations, in parallel.
+
+async def _tool_search_web(query: str) -> Dict[str, Any]:
+    """Web search — Chrome Google tab, DDG (default), or Gemini if SEARCH_PROVIDER=gemini.
+    Vertex grounding-redirector URLs (Gemini) are resolved to real destinations."""
+    if not llm.available:
+        return {"error": "LLM unavailable"}
+    try:
+        from llm_provider import search_provider
+
+        raw_results: Optional[List[Dict[str, str]]] = None
+        if search_provider() == "chrome":
+            raw_results = await _chrome_google_search(query)
+            if raw_results:
+                append_log("scout", f"Chrome Google search returned {len(raw_results)} result(s).", "info")
+        if not raw_results:
+            raw_results = await llm.web_search(query)
         urls = [r["url"] for r in raw_results]
         resolved = await _resolve_vertex_urls_parallel(urls)
         cleaned: List[Dict[str, str]] = []
@@ -909,7 +844,16 @@ async def _tool_search_web(query: str) -> Dict[str, Any]:
             seen_urls.add(real_url)
             cleaned.append({"title": r["title"], "url": real_url, "snippet": r.get("snippet", "")})
 
-        return {"results": cleaned[:8]}
+        results = cleaned[:8]
+        previews = await fetch_markdown_previews([r["url"] for r in results])
+        if previews:
+            for r in results:
+                preview = previews.get(r["url"])
+                if preview:
+                    r["markdown_preview"] = preview
+            append_log("scout", f"Fetched markdown previews for {len(previews)} search result(s).", "info")
+
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
@@ -963,6 +907,58 @@ async def _auto_dismiss_popups(page, attempts: int = 5) -> int:
     return dismissed
 
 
+async def _capture_viewport_screenshot(page) -> Optional[bytes]:
+    """Take a viewport JPEG screenshot, downsized for the perception sub-agent's
+    multimodal call. Returns None on any failure."""
+    try:
+        raw = await page.screenshot(type="jpeg", quality=70, full_page=False)
+        return _resize_image_bytes(raw, max_dim=720, quality=70)
+    except Exception as e:
+        logger.warning(f"viewport screenshot failed: {e}")
+        return None
+
+
+_CLICKABLES_JS = """() => {
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    if (r.bottom < 0 || r.right < 0 || r.top > window.innerHeight) return false;
+    const s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    return true;
+  };
+  const out = [];
+  const sel = 'button, a[href], [role="button"], [role="link"], [role="menuitem"], input[type="submit"], input[type="button"], [aria-label][onclick]';
+  const seen = new Set();
+  for (const el of document.querySelectorAll(sel)) {
+    if (!isVisible(el)) continue;
+    const role = el.getAttribute('role') || (el.tagName.toLowerCase() === 'a' ? 'link' : 'button');
+    const text = ((el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+      .trim()
+      .replace(/\\s+/g, ' '))
+      .slice(0, 80);
+    if (!text) continue;
+    const key = role + '|' + text;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(role + ': "' + text + '"');
+    if (out.length >= 40) break;
+  }
+  return out;
+}"""
+
+
+async def _capture_visible_clickables(page) -> List[str]:
+    """Return up to 40 visible, interactable elements as 'role: "name"' strings.
+    Gives the perception sub-agent concrete click targets rather than guesses."""
+    try:
+        items = await page.evaluate(_CLICKABLES_JS)
+        return items or []
+    except Exception as e:
+        logger.warning(f"clickables capture failed: {e}")
+        return []
+
+
 async def _tool_open_tab(ctx: ScoutContext, url: str) -> Dict[str, Any]:
     # Refuse to navigate to Vertex's grounding redirector — try to resolve first.
     if _is_vertex_redirector(url):
@@ -971,6 +967,13 @@ async def _tool_open_tab(ctx: ScoutContext, url: str) -> Dict[str, Any]:
         if _is_vertex_redirector(resolved):
             return {"error": "URL is a Vertex search redirector with no real destination; pick a different result."}
         url = resolved
+
+    if use_extension_browser():
+        result = await dispatch_browser_action(ctx.scout_id, "open_link", {"url": url})
+        tab_id = result.get("tab_id")
+        if isinstance(tab_id, int):
+            ctx.extension_tab_id = tab_id
+        return result
 
     bctx = await _get_browser_context()
     if bctx is None:
@@ -984,11 +987,16 @@ async def _tool_open_tab(ctx: ScoutContext, url: str) -> Dict[str, Any]:
         dismissed = await _auto_dismiss_popups(ctx.page)
         title = await ctx.page.title()
         text = await ctx.page.evaluate("() => document.body && document.body.innerText || ''")
+        screenshot_bytes = await _capture_viewport_screenshot(ctx.page)
+        clickables = await _capture_visible_clickables(ctx.page)
+        # Underscore-prefixed key signals "internal: don't serialize in observations".
         return {
             "title": title or "",
             "url": ctx.page.url,
             "popups_dismissed": dismissed,
             "cleaned_text": (text or "")[:3000],
+            "clickables": clickables,
+            "_screenshot_bytes": screenshot_bytes,
         }
     except Exception as e:
         return {"error": str(e), "url": url}
@@ -997,10 +1005,22 @@ async def _tool_open_tab(ctx: ScoutContext, url: str) -> Dict[str, Any]:
 async def _tool_click(ctx: ScoutContext, text: str) -> Dict[str, Any]:
     """Click an element by visible text. Useful for residual popups, on-site
     navigation, filter toggles. Returns the page text after the click settles."""
-    if ctx.page is None or ctx.page.is_closed():
-        return {"error": "no active tab; call open_link first"}
     if not text or not text.strip():
         return {"error": "empty text"}
+
+    if use_extension_browser():
+        if ctx.extension_tab_id is None:
+            return {"error": "no active tab; call open_link first"}
+        result = await dispatch_browser_action(
+            ctx.scout_id, "click", {"text": text, "tab_id": ctx.extension_tab_id}
+        )
+        if "error" not in result:
+            result["cleaned_text"] = result.get("page_text_after", "")
+            result["clickables"] = result.get("clickables", [])
+        return result
+
+    if ctx.page is None or ctx.page.is_closed():
+        return {"error": "no active tab; call open_link first"}
     candidates = [
         # Exact button match first (highest precision)
         f'button:has-text("{text}")',
@@ -1033,6 +1053,16 @@ async def _tool_click(ctx: ScoutContext, text: str) -> Dict[str, Any]:
 
 
 async def _tool_scroll(ctx: ScoutContext, direction: str, amount_px: int) -> Dict[str, Any]:
+    if use_extension_browser():
+        if ctx.extension_tab_id is None:
+            return {"error": "no active tab; call open_tab first"}
+        result = await dispatch_browser_action(
+            ctx.scout_id,
+            "scroll_and_capture",
+            {"direction": direction, "amount_px": amount_px, "tab_id": ctx.extension_tab_id},
+        )
+        return result
+
     if ctx.page is None or ctx.page.is_closed():
         return {"error": "no active tab; call open_tab first"}
     try:
@@ -1041,9 +1071,14 @@ async def _tool_scroll(ctx: ScoutContext, direction: str, amount_px: int) -> Dic
         await ctx.page.evaluate(f"() => window.scrollBy(0, {delta})")
         await ctx.page.wait_for_timeout(1000)
         new_text = await ctx.page.evaluate("() => document.body && document.body.innerText || ''")
-        # Naive diff: return text length and the substring after the previous tail
         added = new_text[len(prev_text):] if new_text.startswith(prev_text) else new_text
-        return {"new_text": added[:2500] or new_text[-2500:]}
+        screenshot_bytes = await _capture_viewport_screenshot(ctx.page)
+        clickables = await _capture_visible_clickables(ctx.page)
+        return {
+            "new_text": added[:2500] or new_text[-2500:],
+            "clickables": clickables,
+            "_screenshot_bytes": screenshot_bytes,
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1069,7 +1104,8 @@ class ObservationInsight(BaseModel):
     candidate_image_url: Optional[str] = Field(None, description="Representative image URL from the page, if any.")
     candidate_match_reason: Optional[str] = Field(None, description="One concise sentence explaining the fit (cluster theme + taste profile). Required if is_viable_lead is true.")
     summary: str = Field(description="One-to-two sentence digest of what this page actually said — products, themes, prices, key info.")
-    next_action_hint: str = Field(description="One of: 'add_candidate' (commit the above), 'scroll' (relevant content likely below the fold), 'click_close' (popup blocking content), 'open_different' (page not useful, try another lead), 'done' (enough committed).")
+    next_action_hint: str = Field(description="One of: 'add_candidate' (commit the above), 'scroll' (relevant content likely below the fold), 'click_close' (popup blocking content), 'click' (some other element worth interacting with), 'open_different' (page not useful, try another lead), 'done' (enough committed).")
+    click_target: Optional[str] = Field(None, description="Exact visible text of the element to click — REQUIRED whenever next_action_hint is 'click_close' or 'click'. Pick from the visible-clickables list provided in the prompt. The parent agent will call click(text=this) directly.")
 
 
 async def _summarize_observation(
@@ -1080,37 +1116,71 @@ async def _summarize_observation(
     """Run a focused Flash call to turn raw browser output into a structured
     insight the parent ReAct loop can actually reason about. Returns the dict
     form of ObservationInsight, or None on failure."""
-    if client is None:
+    if not llm.available:
         return None
     # Project the raw result to a compact text view of just what the model needs to judge
+    parts: List[ContentPart] = []
     if source_tool == "extract_products":
         products = raw_result.get("products") or []
         page_url = raw_result.get("page_url") or ""
         page_view = f"Page URL: {page_url}\nExtracted products ({len(products)}):\n" + json.dumps(products[:20], indent=2)
-    else:  # open_link / scroll_and_capture
+    else:  # open_link / scroll_and_capture — pass the actual screenshot as a Part
         title = raw_result.get("title") or ""
         url = raw_result.get("url") or ""
         text = raw_result.get("cleaned_text") or raw_result.get("new_text") or ""
-        page_view = f"Page title: {title}\nURL: {url}\n\nPage text (first 2500 chars):\n{(text or '')[:2500]}"
+        clickables = raw_result.get("clickables") or []
+        clickables_block = "\n".join(f"  - {c}" for c in clickables[:30]) or "  (none detected)"
+        page_view = (
+            f"Page title: {title}\n"
+            f"URL: {url}\n\n"
+            f"Visible clickable elements (role + visible text) — pick from these when you need a click_target:\n"
+            f"{clickables_block}\n\n"
+            f"Page text (first 2500 chars):\n{(text or '')[:2500]}"
+        )
+        screenshot = raw_result.get("_screenshot_bytes")
+        if screenshot:
+            parts.append((screenshot, "image/jpeg"))
 
     prompt = (
         "You are the perception sub-agent for a research scout. Your job is to read the "
         "result of one browser action and decide, in structured form, whether it surfaced a "
         "candidate worth committing to the user's moodboard cluster — and what the parent "
-        "agent should do next.\n\n"
+        "agent should do NEXT.\n\n"
         f"[CLUSTER] {ctx.cluster_label}\n"
         f"[USER TASTE PROFILE]\n{ctx.taste_profile}\n\n"
         f"[USER CURRENCY] {ctx.user_currency}\n\n"
         f"[ALREADY COMMITTED] {len(ctx.committed_candidates)}\n\n"
         f"[BROWSER ACTION RESULT — from {source_tool}]\n{page_view}\n\n"
         "Decide: is there a viable candidate here? If yes, fill the candidate_* fields. "
-        "If not, explain briefly and recommend the next move. Be honest about non-fits — "
-        "don't invent candidates from generic landing pages or popup copy. If you see common "
-        "popup language (cookie consent, newsletter signup), set next_action_hint to "
-        "'click_close' instead of trying to invent a candidate."
+        "Be honest about non-fits — don't invent candidates from generic landing pages or popup copy.\n\n"
+        "How to pick next_action_hint (BE CONSERVATIVE about 'add_candidate'):\n"
+        "- Only return 'add_candidate' when the page CLEARLY shows a real item with a verifiable price "
+        "and an image URL (or enough detail to make match_reason airtight). Vague mentions or category "
+        "pages alone are not enough.\n"
+        "- If the page text is mostly navigation, hero copy, or section headers and the actual content "
+        "(prices, listings) hasn't appeared yet, return 'scroll' — the goods are below the fold.\n"
+        "- If you see a retailer/listing page with multiple items implied but not all visible, return "
+        "'scroll' or have the parent run extract_products via a follow-up.\n"
+        "- If the visible text is cookie-consent copy, newsletter signup, or modal language, return "
+        "'click_close' AND set click_target to the exact visible text of the dismiss button from the "
+        "visible-clickables list (e.g. 'Accept all', 'No thanks', 'Close').\n"
+        "- If a different visible element should be interacted with to reveal content (e.g. an 'Open menu', "
+        "expand-a-section button, language selector), return 'click' AND set click_target to that element's "
+        "visible text.\n"
+        "- If the page is fundamentally off-topic for the cluster, return 'open_different' so the scout "
+        "tries the next search result instead.\n"
+        "- Return 'done' only if the scout has enough commits already AND nothing on this page adds value.\n\n"
+        "click_target is REQUIRED whenever next_action_hint is 'click_close' or 'click'. Pull its value "
+        "verbatim from the visible-clickables list above — the parent agent calls click(text=this) directly, "
+        "so it must match an actual visible element.\n\n"
+        "Default bias: if the evidence is partial, return 'scroll' rather than 'add_candidate'. A premature "
+        "commit with weak match_reason wastes a candidate slot.\n\n"
+        + ("A screenshot of the visible viewport is attached above this prompt — use it as your primary "
+           "evidence (the page text and clickables list are supplementary). The screenshot shows you what "
+           "the user would see if they had this tab open right now.\n\n" if parts else "")
     )
     try:
-        data = await _generate_structured(prompt, ObservationInsight)
+        data = await _generate_structured(prompt, ObservationInsight, parts=parts or None)
         return data
     except Exception as e:
         logger.warning(f"observation summarization failed: {e}")
@@ -1118,14 +1188,30 @@ async def _summarize_observation(
 
 
 async def _tool_extract_products(ctx: ScoutContext) -> Dict[str, Any]:
-    if ctx.page is None or ctx.page.is_closed():
-        return {"error": "no active tab; call open_tab first"}
-    if client is None:
-        return {"error": "no API key"}
+    if not llm.available:
+        return {"error": "LLM unavailable"}
+
+    if use_extension_browser():
+        if ctx.extension_tab_id is None:
+            return {"error": "no active tab; call open_tab first"}
+        raw = await dispatch_browser_action(
+            ctx.scout_id, "extract_products", {"tab_id": ctx.extension_tab_id}
+        )
+        if "error" in raw:
+            return raw
+        page_url = raw.get("page_url") or ""
+        snippet = (raw.get("cleaned_text") or "")[:6000]
+    else:
+        if ctx.page is None or ctx.page.is_closed():
+            return {"error": "no active tab; call open_tab first"}
+        try:
+            page_url = ctx.page.url
+            text = await ctx.page.evaluate("() => document.body && document.body.innerText || ''")
+            snippet = (text or "")[:6000]
+        except Exception as e:
+            return {"error": str(e)}
+
     try:
-        page_url = ctx.page.url
-        text = await ctx.page.evaluate("() => document.body && document.body.innerText || ''")
-        snippet = (text or "")[:6000]
         prompt = (
             "Extract every distinct product, listing, or bookable item visible on this page. "
             "For each, return title, price (string as shown), image_url if any, and product_url "
@@ -1250,71 +1336,61 @@ async def run_scout_single(
         phase="start",
     )
 
-    if client is None:
-        append_log("scout", f"[{scout_id}] no API key — returning a mock candidate.", "warning")
+    if not llm.available:
+        append_log("scout", f"[{scout_id}] LLM unavailable ({llm.provider_name}) — returning a mock candidate.", "warning")
         await asyncio.sleep(0.3)
         return [Candidate(
             title=f"Mock candidate for {cluster_label}",
             url="https://example.com/mock",
             price="$100",
             image_url=None,
-            match_reason="Mock — set GEMINI_API_KEY to enable the real ReAct loop.",
+            match_reason=f"Mock — configure LLM_PROVIDER and LLM_MODEL to enable the real ReAct loop.",
         )]
 
     try:
         for step in range(MAX_SCOUT_STEPS):
             step_prompt = _build_step_prompt(ctx)
-            response = await client.aio.models.generate_content(
-                model=MODEL,
-                contents=step_prompt,
-                config=types.GenerateContentConfig(
-                    tools=[SCOUT_TOOLS],
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode="ANY"),
-                    ),
-                    system_instruction=SCOUT_SYSTEM,
-                    # High thinking budget for the orchestrator decision — the
-                    # ReAct loop benefits from deep reasoning over each tool's result.
-                    thinking_config=types.ThinkingConfig(include_thoughts=True, thinking_level="high"),
-                ),
+            tool_result = await llm.generate_tool_call(
+                step_prompt,
+                tools=SCOUT_TOOLS,
+                system_instruction=SCOUT_SYSTEM,
             )
 
-            # Surface thinking parts + locate the function_call
-            fc = None
-            for cand in (response.candidates or []):
-                if not (cand.content and cand.content.parts):
-                    continue
-                for part in cand.content.parts:
-                    if getattr(part, "thought", False) and getattr(part, "text", None):
-                        text = part.text.strip()
-                        first = text.split("\n", 1)[0]
-                        append_log("scout", f"[{scout_id}] thinking: {first[:140]}", "info", details=text)
-                    if getattr(part, "function_call", None):
-                        fc = part.function_call
-
-            if fc is None:
+            if tool_result is None:
                 append_log("scout", f"[{scout_id}] no tool call returned at step {step+1}; ending.", "warning")
                 break
 
-            args = dict(fc.args or {})
+            if tool_result.thinking:
+                text = tool_result.thinking.strip()
+                step_n = step + 1
+                append_log(
+                    "scout",
+                    f"[{scout_id}] step {step_n} reasoning",
+                    "info",
+                    details=text,
+                    kind="reasoning",
+                    cluster_id=ctx.cluster_id,
+                )
+
+            args = dict(tool_result.args or {})
             args_preview = json.dumps(args, default=str)
             if len(args_preview) > 160:
                 args_preview = args_preview[:160] + "…"
-            append_log("scout", f"[{scout_id}] → {fc.name}({args_preview})", "info")
+            append_log("scout", f"[{scout_id}] → {tool_result.name}({args_preview})", "info")
 
             # Execute the chosen tool
-            if fc.name == "done":
+            if tool_result.name == "done":
                 append_log(
                     "scout",
                     f"[{scout_id}] done — committed {len(ctx.committed_candidates)} candidate(s).",
                     "success",
                 )
                 break
-            elif fc.name == "add_candidate":
+            elif tool_result.name == "add_candidate":
                 result = await _tool_add_candidate(ctx, args)
-            elif fc.name == "search_web":
+            elif tool_result.name == "search_web":
                 result = await _tool_search_web(args.get("query", ""))
-            elif fc.name in ("open_link", "open_tab"):  # tolerate old name during transition
+            elif tool_result.name in ("open_link", "open_tab"):  # tolerate old name during transition
                 result = await _tool_open_tab(ctx, args.get("url", ""))
                 if isinstance(result, dict) and "error" not in result:
                     insight = await _summarize_observation(ctx, "open_link", result)
@@ -1326,15 +1402,19 @@ async def run_scout_single(
                             "info" if insight.get("is_viable_lead") else "warning",
                             details=json.dumps(insight, indent=2),
                         )
-            elif fc.name == "click":
+                    if isinstance(result, dict):
+                        result.pop("_screenshot_bytes", None)
+            elif tool_result.name == "click":
                 result = await _tool_click(ctx, args.get("text", ""))
-            elif fc.name == "scroll_and_capture":
+            elif tool_result.name == "scroll_and_capture":
                 result = await _tool_scroll(ctx, args.get("direction", "down"), int(args.get("amount_px") or 800))
                 if isinstance(result, dict) and "error" not in result:
                     insight = await _summarize_observation(ctx, "scroll_and_capture", result)
                     if insight:
                         result["insight"] = insight
-            elif fc.name == "extract_products":
+                    if isinstance(result, dict):
+                        result.pop("_screenshot_bytes", None)
+            elif tool_result.name == "extract_products":
                 result = await _tool_extract_products(ctx)
                 if isinstance(result, dict) and "error" not in result:
                     insight = await _summarize_observation(ctx, "extract_products", result)
@@ -1346,14 +1426,14 @@ async def run_scout_single(
                             "info" if insight.get("is_viable_lead") else "warning",
                             details=json.dumps(insight, indent=2),
                         )
-            elif fc.name == "note":
+            elif tool_result.name == "note":
                 result = _tool_note(ctx, args.get("content", ""))
             else:
-                result = {"error": f"unknown tool: {fc.name}"}
+                result = {"error": f"unknown tool: {tool_result.name}"}
 
             # `done` short-circuits above; for everything else, record + log.
-            if fc.name != "done":
-                ctx.observations.append({"step": step + 1, "action": fc.name, "args": args, "result": result})
+            if tool_result.name != "done":
+                ctx.observations.append({"step": step + 1, "action": tool_result.name, "args": args, "result": result})
                 if isinstance(result, dict) and "error" in result:
                     append_log("scout", f"[{scout_id}] observed error: {result['error']}", "warning",
                                details=_summarize_for_log(result, limit=1200))
@@ -1408,7 +1488,25 @@ async def _enrich_candidate_images(candidates: List[Candidate]) -> None:
     await asyncio.gather(*(enrich(c) for c in candidates), return_exceptions=True)
 
 
-# ======================= STAGE (Playwright, sync) =======================
+# ======================= STAGE =======================
+async def run_extension_stage(url: str) -> StageResponse:
+    """Open URL via Chrome extension scout tab group; emit stage_complete over SSE."""
+    append_log("stage", f"Stage start (extension) — url='{url}'", "info")
+    result = await dispatch_browser_action("stage", "open_link", {"url": url, "stage": True})
+    if result.get("error"):
+        append_log("stage", f"Stage failed: {result['error']}", "error")
+        return StageResponse(status="failed", screenshot_path=None)
+    push_event({
+        "kind": "stage_complete",
+        "url": result.get("url") or url,
+        "title": result.get("title"),
+        "image_url": result.get("og_image"),
+        "price": result.get("price"),
+    })
+    append_log("stage", "Stage success — tab left open in scout group.", "success")
+    return StageResponse(status="success", screenshot_path=None)
+
+
 def run_playwright_stage(url: str) -> StageResponse:
     """
     Sync Playwright stub. Launches Chrome with the user's persistent profile,
@@ -1416,20 +1514,33 @@ def run_playwright_stage(url: str) -> StageResponse:
     main.py via run_in_executor to avoid blocking the FastAPI event loop.
     """
     append_log("stage", f"Stage start — url='{url}'", "info")
-    user_data_dir = os.path.expandvars("$HOME/chrome-debug-profile2")
-    append_log("stage", f"Persistent profile: {user_data_dir}", "info")
 
     try:
         from playwright.sync_api import sync_playwright
 
-        append_log("stage", "Launching Chromium persistent context…", "info")
         with sync_playwright() as p:
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=False,
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
-            )
-            page = ctx.new_page() if not ctx.pages else ctx.pages[0]
+            page = None
+            cdp_status = probe_cdp(SCOUT_CDP_ENDPOINT)
+
+            if cdp_status["reachable"]:
+                try:
+                    browser = p.chromium.connect_over_cdp(SCOUT_CDP_ENDPOINT)
+                    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+                    page = ctx.new_page()
+                    browser_label = cdp_status.get("browser") or "Chrome"
+                    append_log("stage", f"Attached to {browser_label} via CDP.", "info")
+                except Exception as e:
+                    append_log("stage", f"CDP attach failed ({e}); trying Playwright Chromium.", "warning")
+
+            if page is None:
+                os.makedirs(CHROME_FALLBACK_PROFILE, exist_ok=True)
+                append_log("stage", f"Launching Playwright Chromium (profile: {CHROME_FALLBACK_PROFILE}).", "info")
+                ctx = p.chromium.launch_persistent_context(
+                    user_data_dir=CHROME_FALLBACK_PROFILE,
+                    headless=False,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"],
+                )
+                page = ctx.new_page() if not ctx.pages else ctx.pages[0]
 
             append_log("stage", f"Navigating to '{url}'…", "info")
             page.goto(url, timeout=30000)

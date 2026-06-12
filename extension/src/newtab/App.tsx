@@ -1,17 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { DndContext, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
 import type { DragEndEvent } from '@dnd-kit/core';
-import { Canvas } from './components/Canvas';
-import { DropZone } from './components/DropZone';
-import { Sidebar } from './components/Sidebar';
-import type { Candidate } from './components/Sidebar';
-import { ActivityLog } from './components/ActivityLog';
-import type { LogEntry } from './components/ActivityLog';
-import type { CardType } from './components/Card';
-import type { SuggestionType } from './components/SuggestionCard';
-import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp, ZoomIn, ZoomOut, Maximize2, Download, Upload } from 'lucide-react';
-
-const API_BASE = 'http://localhost:8000';
+import { Canvas } from '@frontend/components/Canvas';
+import { DropZone } from '@frontend/components/DropZone';
+import { Sidebar } from '@frontend/components/Sidebar';
+import type { Candidate } from '@frontend/components/Sidebar';
+import { ActivityLog } from '@frontend/components/ActivityLog';
+import type { LogEntry } from '@frontend/components/ActivityLog';
+import type { CardType } from '@frontend/components/Card';
+import type { SuggestionType } from '@frontend/components/SuggestionCard';
+import { Sparkles, RotateCcw, AlertTriangle, CheckCircle, Info, Loader2, PanelRightClose, PanelRightOpen, ChevronDown, ChevronUp, ZoomIn, ZoomOut, Maximize2, Download, Upload, Settings, X } from 'lucide-react';
+import { getApiBase } from '../lib/config';
+import { loadBoardState, saveBoardKey, clearBoardStorage } from '../lib/storage';
 
 // Map browser locale → display currency. Falls back to USD.
 const REGION_CURRENCY: Record<string, string> = {
@@ -92,7 +92,7 @@ const LAYOUT = {
   CARD_GAP: 20,
 };
 
-function autoLayoutByCluster(clusters: ClusterType[], cards: import('./components/Card').CardType[]) {
+function autoLayoutByCluster(clusters: ClusterType[], cards: CardType[]) {
   const byId = new Map(cards.map((c) => [c.id, c]));
   const positioned = new Set<string>();
   const out: typeof cards = [];
@@ -125,6 +125,13 @@ function autoLayoutByCluster(clusters: ClusterType[], cards: import('./component
 }
 
 export default function App() {
+  const [apiBase, setApiBase] = useState('http://localhost:8000');
+  const [backendStatus, setBackendStatus] = useState<{
+    ok: boolean;
+    ollama?: boolean;
+    extension_connected?: boolean;
+    model?: string;
+  } | null>(null);
   const [cards, setCards] = useState<CardType[]>([]);
   // Suggestions now live on the canvas as ghost cards, positioned in their cluster.
   const [suggestions, setSuggestions] = useState<SuggestionType[]>([]);
@@ -210,19 +217,46 @@ export default function App() {
     };
   }
 
-  // 1. Load from LocalStorage or initialize with 4 premium demo cards
+  // Resolve API base from extension storage
   useEffect(() => {
-    const savedCards = localStorage.getItem('moodboard_cards');
-    const savedSuggestions = localStorage.getItem('moodboard_suggestions');
-    const savedTaste = localStorage.getItem('moodboard_taste');
-    const savedGaps = localStorage.getItem('moodboard_gaps');
-    const savedClusters = localStorage.getItem('moodboard_clusters');
-    if (savedClusters) {
-      try { setClusters(JSON.parse(savedClusters)); } catch {}
+    void getApiBase().then(setApiBase);
+  }, []);
+
+  // Poll backend / extension status for setup banner
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const r = await fetch(`${apiBase}/extension/status`);
+        if (r.ok) {
+          const data = await r.json();
+          setBackendStatus({
+            ok: data.backend === 'ok',
+            ollama: data.ollama?.reachable,
+            extension_connected: data.extension_connected,
+            model: data.ollama?.model || data.model,
+          });
+        } else {
+          setBackendStatus({ ok: false });
+        }
+      } catch {
+        setBackendStatus({ ok: false });
+      }
+    };
+    check();
+    const id = setInterval(check, 15000);
+    return () => clearInterval(id);
+  }, [apiBase]);
+
+  // 1. Load from chrome.storage or initialize with demo cards
+  useEffect(() => {
+    void (async () => {
+    const saved = await loadBoardState();
+    if (saved.clusters) {
+      try { setClusters(JSON.parse(saved.clusters)); } catch {}
     }
 
-    if (savedCards) {
-      const restored: CardType[] = JSON.parse(savedCards);
+    if (saved.cards) {
+      const restored: CardType[] = JSON.parse(saved.cards);
       // Any card stuck mid-enrichment (page closed before backend responded)
       // gets marked ready so the pulse stops. User can re-paste if they want.
       setCards(restored.map((c) => (c.status && c.status !== 'ready' ? { ...c, status: 'ready' } : c)));
@@ -276,47 +310,80 @@ export default function App() {
       setCards(demoCards);
     }
 
-    if (savedSuggestions) setSuggestions(JSON.parse(savedSuggestions));
-    if (savedTaste) setTasteProfile(savedTaste);
-    if (savedGaps) setGaps(JSON.parse(savedGaps));
+    if (saved.suggestions) setSuggestions(JSON.parse(saved.suggestions));
+    if (saved.taste) setTasteProfile(saved.taste);
+    if (saved.gaps) setGaps(JSON.parse(saved.gaps));
+    })();
   }, []);
 
-  // 2. Save state to LocalStorage
+  // 2. Save state to chrome.storage.local
   useEffect(() => {
     if (cards.length > 0) {
-      localStorage.setItem('moodboard_cards', JSON.stringify(cards));
+      void saveBoardKey('cards', JSON.stringify(cards));
     } else {
-      localStorage.removeItem('moodboard_cards');
+      void saveBoardKey('cards', null);
     }
   }, [cards]);
 
   useEffect(() => {
-    localStorage.setItem('moodboard_suggestions', JSON.stringify(suggestions));
+    void saveBoardKey('suggestions', JSON.stringify(suggestions));
   }, [suggestions]);
 
   useEffect(() => {
-    localStorage.setItem('moodboard_taste', tasteProfile);
+    void saveBoardKey('taste', tasteProfile || null);
   }, [tasteProfile]);
 
   useEffect(() => {
-    localStorage.setItem('moodboard_gaps', JSON.stringify(gaps));
+    void saveBoardKey('gaps', JSON.stringify(gaps));
   }, [gaps]);
 
   useEffect(() => {
     if (clusters.length > 0) {
-      localStorage.setItem('moodboard_clusters', JSON.stringify(clusters));
+      void saveBoardKey('clusters', JSON.stringify(clusters));
     } else {
-      localStorage.removeItem('moodboard_clusters');
+      void saveBoardKey('clusters', null);
     }
   }, [clusters]);
 
+  // Wake the MV3 service worker so scout browser actions work (open_link, etc.)
+  useEffect(() => {
+    void chrome.runtime.sendMessage({ type: 'wake' }).catch(() => {});
+  }, [apiBase]);
+
   // 3. Connect to backend Server-Sent Events stream — log entries + live candidates
   useEffect(() => {
-    const eventSource = new EventSource(`${API_BASE}/events`);
+    let eventSource: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
 
-    eventSource.onmessage = (event) => {
+    const connect = () => {
+      if (disposed) return;
+      eventSource?.close();
+      eventSource = new EventSource(`${apiBase}/events`);
+
+      eventSource.onopen = () => {
+        void chrome.runtime.sendMessage({ type: 'wake' }).catch(() => {});
+      };
+
+      eventSource.onmessage = (event) => {
       try {
+        if (!event.data) return;
         const data = JSON.parse(event.data);
+
+        // Background worker handles browser_action; ignore here.
+        if (data.kind === 'browser_action' || data.kind === 'ingest_card') return;
+
+        if (data.kind === 'stage_complete' && data.url) {
+          setSuggestions((prev) =>
+            prev.map((s) =>
+              s.url === data.url
+                ? { ...s, image_url: data.image_url || s.image_url, price: data.price || s.price }
+                : s,
+            ),
+          );
+          showToast('Staged in Chrome — tab left open', 'success');
+          return;
+        }
 
         // Streaming candidate from a scout — drop it into its cluster on the canvas.
         if (data.kind === 'candidate' && data.candidate) {
@@ -338,7 +405,8 @@ export default function App() {
           return;
         }
 
-        // Otherwise it's a log entry. Track scout start/end phases for cluster highlight.
+        // Otherwise it's a log entry (must have agent + message).
+        if (!data.agent || !data.message) return;
         const log = data as LogEntry;
         if (log.cluster_id && log.phase) {
           const cid = log.cluster_id;
@@ -363,14 +431,26 @@ export default function App() {
       }
     };
 
-    eventSource.onerror = (err) => {
-      console.warn('SSE EventSource lost connection. Retrying...');
+      eventSource.onerror = () => {
+        eventSource?.close();
+        eventSource = null;
+        if (!disposed && !reconnectTimer) {
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            connect();
+          }, 3000);
+        }
+      };
     };
 
+    connect();
+
     return () => {
-      eventSource.close();
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      eventSource?.close();
     };
-  }, []);
+  }, [apiBase]);
 
   // Cmd+V anywhere → if the clipboard has an image, ingest it as a card.
   // Text paste into focused inputs is unaffected (browser handles it).
@@ -402,6 +482,27 @@ export default function App() {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 4000);
   };
+
+  // Context-menu ingest from background service worker
+  useEffect(() => {
+    const listener = (msg: { type?: string; card?: CardType }) => {
+      if (msg?.type === 'ingest_card' && msg.card) {
+        const c = msg.card;
+        setCards((prev) => [
+          ...prev,
+          {
+            ...c,
+            x: 100 + Math.random() * 200,
+            y: 100 + Math.random() * 200,
+            status: 'ready' as const,
+          },
+        ]);
+        showToast(`Added: "${c.title}"`, 'success');
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    return () => chrome.runtime.onMessage.removeListener(listener);
+  }, []);
 
   // --- Handlers ---
 
@@ -462,9 +563,9 @@ export default function App() {
         const formData = new FormData();
         formData.append('file', payload.file);
         if (payload.hint) formData.append('hint', payload.hint);
-        response = await fetch(`${API_BASE}/ingest`, { method: 'POST', body: formData });
+        response = await fetch(`${apiBase}/ingest`, { method: 'POST', body: formData });
       } else {
-        response = await fetch(`${API_BASE}/ingest`, {
+        response = await fetch(`${apiBase}/ingest`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: payload.content, hint: payload.hint }),
@@ -620,7 +721,7 @@ export default function App() {
   // stable). Called after feedback so the user visibly sees the profile evolve.
   const refreshTasteProfile = async () => {
     try {
-      const r = await fetch(`${API_BASE}/curate`, {
+      const r = await fetch(`${apiBase}/curate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cards }),
@@ -637,7 +738,7 @@ export default function App() {
   const handleDismissSuggestion = async (s: SuggestionType, reason: string | null) => {
     setSuggestions((prev) => prev.filter((x) => x.url !== s.url));
     try {
-      await fetch(`${API_BASE}/feedback`, {
+      await fetch(`${apiBase}/feedback`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -662,7 +763,7 @@ export default function App() {
   const handleStageSuggestion = async (url: string) => {
     setIsStagingUrl(url);
     try {
-      const response = await fetch(`${API_BASE}/stage`, {
+      const response = await fetch(`${apiBase}/stage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
@@ -670,11 +771,11 @@ export default function App() {
 
       if (!response.ok) throw new Error('Staging failed');
       const data = await response.json();
-      
+
       if (data.status === 'success') {
-        showToast('Cart Staged! Browser window left open for purchase.', 'success');
+        showToast('Opening in Chrome scout group…', 'success');
       } else {
-        showToast(`Staging failed: ${data.message}`, 'error');
+        showToast('Staging failed', 'error');
       }
     } catch (err) {
       showToast('Staging browser failed', 'error');
@@ -699,7 +800,7 @@ export default function App() {
 
     try {
       // 1. Curate Board
-      const curateResponse = await fetch(`${API_BASE}/curate`, {
+      const curateResponse = await fetch(`${apiBase}/curate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cards }),
@@ -725,7 +826,7 @@ export default function App() {
 
       // 2. Orchestrate Dispatches
       showToast('Orchestrator matching gaps into scout briefs...', 'info');
-      const orchestrateResponse = await fetch(`${API_BASE}/orchestrate`, {
+      const orchestrateResponse = await fetch(`${apiBase}/orchestrate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -766,7 +867,7 @@ export default function App() {
           };
         });
 
-        const scoutResponse = await fetch(`${API_BASE}/scout`, {
+        const scoutResponse = await fetch(`${apiBase}/scout`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(scoutRequests),
@@ -867,16 +968,36 @@ export default function App() {
 
   // Reset local storage board state to default
   const handleResetBoard = () => {
-    localStorage.removeItem('moodboard_cards');
-    localStorage.removeItem('moodboard_suggestions');
-    localStorage.removeItem('moodboard_taste');
-    localStorage.removeItem('moodboard_gaps');
-    window.location.reload();
+    void clearBoardStorage().then(() => window.location.reload());
+  };
+
+  const handleClearScouts = () => {
+    chrome.runtime.sendMessage({ type: 'clear_scout_group' });
+    showToast('Scout tab group cleared', 'info');
   };
 
   return (
     <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
       
+      {/* Setup banner when backend or extension link is down */}
+      {backendStatus && (!backendStatus.ok || !backendStatus.extension_connected) && (
+        <div className="fixed top-0 left-0 right-0 z-[10000] bg-[#A85E40] text-white px-4 py-2 text-[11px] flex items-center justify-between gap-4 pointer-events-auto">
+          <span>
+            {!backendStatus.ok
+              ? 'Backend offline — run: cd backend && .venv/bin/uvicorn main:app --reload --port 8000'
+              : 'Extension not linked to backend — reload extension or check service worker'}
+            {backendStatus.model ? ` · Model: ${backendStatus.model}` : ''}
+          </span>
+          <button
+            type="button"
+            onClick={() => chrome.runtime.openOptionsPage()}
+            className="shrink-0 flex items-center gap-1 underline"
+          >
+            <Settings className="w-3 h-3" /> Options
+          </button>
+        </div>
+      )}
+
       {/* Toasts */}
       <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-2 pointer-events-none max-w-sm">
         {toasts.map((toast) => (
@@ -935,7 +1056,7 @@ export default function App() {
               Moodboard
             </h1>
             <p className="text-[10px] text-stone-500 font-medium">
-              Multi-agent scouting · live Chrome orchestration
+              Local Ollama · extension scouts
             </p>
           </div>
         </header>
@@ -994,6 +1115,14 @@ export default function App() {
             title="Export board as JSON"
           >
             <Download className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={handleClearScouts}
+            className="px-3 py-1.5 rounded-md panel-surface text-[11px] font-semibold text-stone-600 hover:text-stone-800 hover:bg-[#EDE0C6] transition-colors flex items-center gap-1.5"
+            title="Close scout tab group"
+          >
+            <X className="w-3.5 h-3.5" />
+            <span>Clear scouts</span>
           </button>
           <button
             onClick={handleResetBoard}

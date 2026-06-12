@@ -2,9 +2,11 @@ fastapi
 uvicorn[standard]
 pydantic
 google-genai
+openai
 playwright
 sse-starlette
 requests
 python-multipart
 python-dotenv
 Pillow
+cursor-sdk

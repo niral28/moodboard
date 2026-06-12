@@ -17,11 +17,24 @@ from models import (
     ScoutDispatch, OrchestrateRequest, OrchestrateResponse,
     Candidate, ScoutRequest, ScoutResponse, StageRequest, StageResponse,
     FeedbackRequest, FeedbackResponse,
+    BrowserResultRequest, ExtensionHelloRequest,
+)
+from browser_cdp import CHROME_PROFILE_PATH, SCOUT_CDP_ENDPOINT, cdp_launch_hint, probe_cdp
+from browser_bridge import (
+    browser_backend,
+    extension_connected,
+    get_pending_browser_actions,
+    mark_extension_connected,
+    resolve_browser_action,
+    use_extension_browser,
 )
 from agents import (
-    run_ingest, run_curate, run_orchestrate, run_scout_single, run_playwright_stage,
-    event_logs, event_queue, append_log, append_journal,
+    run_ingest, run_curate, run_orchestrate, run_scout_single,
+    run_playwright_stage, run_extension_stage,
+    event_logs, subscribe_sse, unsubscribe_sse, append_log, append_journal,
+    llm,
 )
+from llm_provider import search_provider
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,12 +54,89 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     append_log("orchestrate", "Moodboard multi-agent backend starting up.", "info")
+    mode = browser_backend()
+    append_log("orchestrate", f"Browser backend mode: {mode}", "info")
+    append_log("orchestrate", f"Search provider: {search_provider()}", "info")
+    if mode == "playwright":
+        cdp = probe_cdp(SCOUT_CDP_ENDPOINT)
+        if cdp["reachable"]:
+            append_log(
+                "orchestrate",
+                f"Chrome CDP ready at {SCOUT_CDP_ENDPOINT} ({cdp.get('browser', 'unknown')}).",
+                "success",
+            )
+        else:
+            append_log("orchestrate", f"Chrome CDP not reachable at {SCOUT_CDP_ENDPOINT}.", "warning")
+            append_log("orchestrate", cdp_launch_hint(), "info")
+    else:
+        append_log("orchestrate", "Waiting for Chrome extension to connect via SSE.", "info")
     append_log("orchestrate", "Ready to ingest visual assets, curate layout, and stage carts.", "info")
 
 # --- 1. Ping Check Endpoint ---
 @app.get("/ping")
 async def ping():
     return {"status": "pong"}
+
+
+@app.get("/browser/status")
+async def browser_status():
+    """Probe Chrome CDP — useful when scout tabs aren't opening."""
+    status = probe_cdp(SCOUT_CDP_ENDPOINT)
+    status["chrome_profile"] = CHROME_PROFILE_PATH
+    status["browser_mode"] = browser_backend()
+    return status
+
+
+@app.get("/extension/status")
+async def extension_status():
+    """Health check for the Chrome extension new-tab page."""
+    ollama_ok = False
+    model = llm.model if llm.available else None
+    try:
+        import requests
+        base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+        host = base.replace("/v1", "")
+        r = requests.get(f"{host}/api/tags", timeout=2)
+        ollama_ok = r.status_code == 200
+    except Exception:
+        pass
+    return {
+        "backend": "ok",
+        "browser_mode": browser_backend(),
+        "extension_connected": extension_connected(),
+        "model": model,
+        "ollama": {"reachable": ollama_ok, "model": model},
+        "llm_provider": llm.provider_name if llm.available else None,
+        "vision_provider": llm._vision.provider_name if llm.vision_available else None,
+        "vision_model": llm._vision.model if llm.vision_available else None,
+        "search_provider": search_provider(),
+    }
+
+
+@app.post("/extension/hello")
+async def extension_hello(req: ExtensionHelloRequest):
+    was_connected = extension_connected()
+    mark_extension_connected()
+    if not was_connected:
+        append_log("orchestrate", f"Chrome extension connected (v{req.version or 'unknown'}).", "success")
+    return {"ok": True}
+
+
+@app.get("/extension/pending-actions")
+async def extension_pending_actions():
+    """Poll fallback for MV3 service workers that miss SSE browser_action events."""
+    mark_extension_connected()
+    return {"actions": get_pending_browser_actions()}
+
+
+@app.post("/browser/result")
+async def browser_result(req: BrowserResultRequest):
+    """Extension posts results for pending scout browser actions."""
+    mark_extension_connected()
+    ok = resolve_browser_action(req.action_id, req.result, req.error)
+    if not ok:
+        return {"ok": False, "error": "unknown or expired action_id"}
+    return {"ok": True}
 
 # --- 2. SSE Log Event Stream ---
 @app.get("/events")
@@ -56,37 +146,39 @@ async def events(request: Request):
     First yields history, then streams incoming events live.
     """
     async def log_generator():
-        # 1. Stream all past logs first so the interface shows history on reconnect
-        for log in event_logs:
-            yield {
-                "event": "message",
-                "id": str(uuid.uuid4()),
-                "data": json.dumps(log)
-            }
-            
-        # 2. Wait and stream new logs from the asyncio Queue
-        while True:
-            if await request.is_disconnected():
-                logger.info("SSE Client disconnected.")
-                break
-                
-            try:
-                # Wait for new log, wake up occasionally to send heartbeats
-                log = await asyncio.wait_for(event_queue.get(), timeout=2.0)
+        queue = subscribe_sse()
+        try:
+            # 1. Stream all past logs first so the interface shows history on reconnect
+            for log in event_logs:
                 yield {
                     "event": "message",
                     "id": str(uuid.uuid4()),
                     "data": json.dumps(log)
                 }
-            except asyncio.TimeoutError:
-                # Send empty heartbeat to prevent network timeouts
-                yield {
-                    "event": "heartbeat",
-                    "data": ""
-                }
-            except Exception as e:
-                logger.error(f"Error in SSE stream: {e}")
-                
+
+            # 2. Wait and stream new logs from this client's queue
+            while True:
+                if await request.is_disconnected():
+                    logger.info("SSE Client disconnected.")
+                    break
+
+                try:
+                    log = await asyncio.wait_for(queue.get(), timeout=2.0)
+                    yield {
+                        "event": "message",
+                        "id": str(uuid.uuid4()),
+                        "data": json.dumps(log)
+                    }
+                except asyncio.TimeoutError:
+                    yield {
+                        "event": "heartbeat",
+                        "data": ""
+                    }
+                except Exception as e:
+                    logger.error(f"Error in SSE stream: {e}")
+        finally:
+            unsubscribe_sse(queue)
+
     return EventSourceResponse(log_generator())
 
 # --- 3. Ingest Endpoint ---
@@ -199,16 +291,11 @@ async def feedback(req: FeedbackRequest):
 # --- 8. Stage Endpoint ---
 @app.post("/stage", response_model=StageResponse)
 async def stage(req: StageRequest):
-    """
-    Stages a candidate shopping or trip booking URL in Chrome via Playwright.
-    Runs inside a threadpool to prevent blocking the async FastAPI app.
-    """
+    """Stage a URL in Chrome — extension tab group (default) or Playwright fallback."""
+    if use_extension_browser():
+        return await run_extension_stage(req.url)
     loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: run_playwright_stage(req.url)
-    )
-    return response
+    return await loop.run_in_executor(None, lambda: run_playwright_stage(req.url))
 
 if __name__ == "__main__":
     import uvicorn

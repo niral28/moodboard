@@ -13,6 +13,7 @@ export interface CardType {
   entities: string[];
   url?: string;
   cover_image?: string;
+  emoji?: string;
   visual_features?: string;
   sender?: string;
   subject?: string;
@@ -101,7 +102,13 @@ export const Card: React.FC<CardProps> = ({ card, onRemove }) => {
             className="w-full h-full flex items-center justify-center"
             style={{ background: theme.gradient }}
           >
-            <TypeIcon className="w-10 h-10 text-white/90" />
+            {card.emoji ? (
+              <span className="text-6xl leading-none select-none" style={{ filter: 'drop-shadow(0 2px 8px rgba(0,0,0,0.25))' }}>
+                {card.emoji}
+              </span>
+            ) : (
+              <TypeIcon className="w-10 h-10 text-white/90" />
+            )}
           </div>
         )}
 
